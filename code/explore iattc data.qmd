@@ -1,0 +1,130 @@
+---
+title: "Explore IATTC Data"
+author: "Owen R. Liu"
+format: html
+editor: visual
+---
+
+## Purpose
+
+Explore the [publicly-available](https://www.iattc.org/en-US/Data/Public-domain) IATTC tuna effort data.
+
+```{r,include=F,message=F,echo=F}
+library(tidyverse)
+library(here)
+library(sf)
+library(terra)
+pt <- theme_minimal()+theme(panel.border = element_rect(color='black',fill=NA))
+theme_set(pt)
+```
+
+## Import
+
+There are three datasets, for three fishery types: pole-and-line, longline, and purse seine.
+```{r}
+# longline, metric tons and numbers
+lld <- read_csv(here('data','PublicLLTunaBillfishMt.csv'))
+# pole and line
+pld <- read_csv(here('data','PublicLPTunaFlag.csv'))
+# purse seine by flag
+psd <- read_csv(here('data','PublicPSTunaFlag.csv'))
+psdt <- read_csv(here('data','PublicPSTunaSetType.csv'))
+
+# flag codes
+flags <- read_csv(here('data','flag_codes.csv'))
+```
+## Simple Time Series
+
+Longline
+
+```{r}
+# total metric tons over time
+llts <- lld |> 
+  left_join(flags,by=join_by(Flag==Code)) |> 
+  dplyr::select(Year:Hooks,Name,contains("mt")) |> 
+  pivot_longer(contains("mt"),names_to="species",values_to="mt") |> 
+  mutate(date=make_date(year=Year,month=Month,day=1)) |> 
+  group_by(date,Name,species) |> 
+  summarise(mt=sum(mt),.groups='drop') |> 
+  ggplot(aes(date,mt,color=species))+
+  geom_line()+
+  facet_wrap(~Name)
+# albacore only
+lltsalb <- lld |> 
+  left_join(flags,by=join_by(Flag==Code)) |> 
+  dplyr::select(Year:Hooks,Name,contains("mt")) |> 
+  pivot_longer(contains("mt"),names_to="species",values_to="mt") |> 
+  filter(species=="ALBmt") |> 
+  mutate(date=make_date(year=Year,month=Month,day=1)) |> 
+  group_by(date,Name,species) |> 
+  summarise(mt=sum(mt),.groups='drop') |> 
+  ggplot(aes(date,mt,color=species))+
+  geom_line()+
+  facet_wrap(~Name)
+lltsalb
+```
+
+Purse seine
+```{r}
+pstsalb <- psd |> 
+  left_join(flags,by=join_by(Flag==Code)) |> 
+  dplyr::select(Year,Month,Name,ALB) |> 
+  mutate(date=make_date(year=Year,month=Month,day=1)) |> 
+  group_by(date,Name) |> 
+  summarise(mt=sum(ALB),.groups='drop') |> 
+  ggplot(aes(date,mt))+
+  geom_line()+
+  facet_wrap(~Name)
+pstsalb
+```
+
+Pole-and-line
+```{r}
+pltsalb <- pld |> 
+  left_join(flags,by=join_by(Flag==Code)) |> 
+  dplyr::select(Year,Month,Name,ALB) |> 
+  mutate(date=make_date(year=Year,month=Month,day=1)) |> 
+  group_by(date,Name) |> 
+  summarise(mt=sum(ALB),.groups='drop') |> 
+  ggplot(aes(date,mt))+
+  geom_line()+
+  facet_wrap(~Name)
+pltsalb
+```
+
+
+## Make Spatial Grid
+
+Make a spatial grid to map this information. The longline data is on a 5x5degree grid, while the other datasets are on a 1x1 grid.
+
+```{r}
+# 5x5 grid
+latmin5 <- min(lld$LatC5)-2.5; latmax5 <- max(lld$LatC5)+2.5
+lonmin5 <- min(lld$LonC5)-2.5; lonmax5 <- max(lld$LonC5)+2.5
+ext5 <- ext(lonmin5,lonmax5,latmin5,latmax5)
+gr5 <- rast(ext=ext5,resolution=5,crs="EPSG:4326")
+values(gr5) <- 1:ncell(gr5)
+
+# 1x1 grid
+latmin1 <- min(pld$LatC1)-0.5; latmax1 <- max(pld$LatC1)+0.5
+lonmin1 <- min(pld$LonC1)-0.5; lonmax1 <- max(pld$LonC1)+0.5
+ext1 <- ext(lonmin1,lonmax1,latmin1,latmax1)
+gr1 <- rast(ext=ext1,resolution=1,crs="EPSG:4326")
+values(gr1) <- 1:ncell(gr1)
+plot(gr5);plot(gr1)
+```
+
+Using this grid, make a function to generically plot some data
+
+```{r}
+plot_eff <- function(dat,year,month,species){
+  df <- dat |> 
+    filter(Year==year,Month==month) |> 
+    dplyr::select(contains("Lon"),contains("Lat"),all_of(species)) |> 
+    set_names(c("lon","lat","val"))
+  out <- rasterize(df,gr1,values=df$val)
+}
+# dat=pld;year=1980;month=4;species="ALB"
+```
+
+
