@@ -1,0 +1,904 @@
+---
+title: "Albacore Logbook Distribution Models"
+format: html
+toc: true
+toc_float: true
+toc-title: "Navigation"
+embed-resources: true
+editor: source
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Purpose
+
+We aim to develop simple fishery distribution models for the non-confidential albacore logbook data, to look at spatial patterns and trends. We will use these as a basis for testing the inclusion of albacore habitat suitability from Mary Margaret Stoll's albacore SDM as a covariate.
+
+```{r,warning=F,message=F}
+library(tidyverse)
+library(terra)
+library(sf)
+library(sdmTMB)
+library(viridis)
+library(here)
+library(rnaturalearth)
+
+tm <- theme_minimal()+theme(panel.border = element_rect(fill=NA,color='black'))
+theme_set(tm)
+
+```
+
+```{r,message=F,warning=F,include=F,eval=F}
+# Basemap
+sf_use_s2(FALSE)
+bg <- ne_countries(scale = "medium", returnclass = "sf") |> st_make_valid()
+
+# Deal with the dateline problem
+# Define the two hemispheres as clipping polygons
+wh <- st_bbox(c(xmin = -180, ymin = -90, xmax = 0, ymax = 90),
+                    crs = 4326) |> st_as_sfc()
+eh <- st_bbox(c(xmin = 0, ymin = -90, xmax = 180, ymax = 90),
+                    crs = 4326) |> st_as_sfc()
+
+# Clip each hemisphere separately, then recombine and shift
+bgw <- st_crop(bg, wh)
+bge <- st_crop(bg, eh)
+
+bg <- rbind(bgw, bge) |>
+  st_shift_longitude()
+bg <- bg[st_is_valid(bg),]
+```
+
+## Load data
+
+Albacore logbook data, coarsened to 1 degree resolution.
+
+```{r}
+dat <- read_csv(here('data','logbook','monthly_1D_albacore_logbook_nonconfidential_Apr2026.csv')) |> 
+  select(-1)
+dprop <- read_csv(here('data','logbook','monthly_1D_albacore_logbook_propRemoved_Apr2026.csv')) |> 
+  select(-1)
+```
+
+
+Albacore SDM data from MM, to be used as a covariate
+
+```{r}
+# non-OIF scenario (i.e., baseline)
+asdm <- read_csv(here('data','albacore sdm','SDM_Output_2004to2013.csv'))
+```
+
+## Preparing to Model
+
+### Covariate setup
+
+```{r}
+# Add a month column, to use as a covariate
+dat <- dat |> 
+  rename(date=month) |> 
+  mutate(month=month.name[month(date)]) |> 
+  # center the "year" column
+  mutate(year=year(date)) |> 
+  # 
+  mutate(lon_1D=ifelse(lon_1D==180,-180,lon_1D))
+```
+
+Calculate the albacore SDM covariate. For now (and we should test this later!) I'll use average suitability in the top 200m.
+
+```{r}
+asdm_filt <- asdm |> 
+  mutate(month=month.name[month]) |> 
+  select(time,year,month,lon,lat,depth,y_pred_proba) |> 
+  # filter(depth<=200) |> 
+  group_by(time,year,month,lon,lat) |> 
+  summarise(mean_suit=mean(y_pred_proba),
+  # depth test
+  # depth of maximum suitability
+            wdepth=depth[which.max(y_pred_proba)],
+            .groups = 'drop')
+```
+
+Rasterize for later spatial reference
+
+```{r}
+# mean suitability top 200m - raster
+asdmr <- asdm_filt |> 
+  select(lon,lat,time,mean_suit) |> 
+  rast(type='xylz',crs="EPSG:4326")
+lyrn <- asdm_filt |> distinct(time,year,month) |> unite("ym",month,year) |> pull(ym)
+names(asdmr) <- lyrn
+
+# depth of maximum suitability
+asdmd <- asdm_filt |> 
+  select(lon,lat,time,wdepth) |> 
+  rast(type='xylz',crs="EPSG:4326")
+names(asdmd) <- lyrn
+
+# Animate the results to see what we have
+# animation::saveGIF(terra::animate(asdmr,n=1,main=lyrn),here('plots','albacore_sdm.gif'))
+# animation::saveGIF(terra::animate(asdmd,n=1,main=lyrn),here('plots','albacore_sdm_best_depth.gif'))
+```
+
+
+```{r}
+# Latitudinal shifts?
+asdm_lat_ts <- asdm_filt |> 
+  group_by(month) |> 
+  summarise(wlat=weighted.mean(lat,mean_suit),.groups = 'drop')
+asdm_lat_ts |> 
+  mutate(month=match(month,month.name)) |> 
+  ggplot(aes(month,wlat))+geom_line()
+
+asdm_lon_ts <- asdm_filt |> 
+  group_by(month) |> 
+  summarise(wlon=weighted.mean(lon,mean_suit),.groups = 'drop')
+asdm_lon_ts |> 
+  mutate(month=match(month,month.name)) |> 
+  ggplot(aes(month,wlon))+geom_line()
+
+# mean cycle of habitat suitability in 3D
+asdm_ll_ts <- asdm_lat_ts |> 
+  left_join(asdm_lon_ts,by=join_by(month))
+asdm_ll_ts |> 
+  mutate(m=match(month,month.name)) |> 
+  arrange(m) |> 
+  mutate(xend=lead(wlon),yend=lead(wlat)) |>
+  ggplot(aes(wlon,wlat,xend=xend,yend=yend,color=m))+
+  geom_segment(linewidth=1,arrow=arrow(type = 'closed',length=unit(0.25,'cm')))+
+  geom_point()+
+  coord_fixed()+
+  scale_color_viridis()+
+  labs(title="Annual Cycle of Suitability",x="Xkm",y="Ykm")
+```
+
+Keep track of the years and months that are in common across the two datasets.
+
+```{r}
+yrsmths <- distinct(dat,year,month) |> 
+  mutate(month=match(month,month.name)) |> 
+  # only keep common year/month combos
+  inner_join(distinct(asdm,year,month),by=join_by(year,month)) |> 
+  mutate(month=month.name[month]) |> 
+  unite("my",month,year,remove=F)
+```
+
+Filter and extract 
+
+```{r}
+dat_sf <- dat |>
+  unite("my",month,year,remove=F) |> 
+  filter(my %in% yrsmths$my) |> 
+  st_as_sf(coords=c("lon_1D","lat_1D"),crs=4326,remove = F) |> 
+  st_shift_longitude()
+
+# for each year/month, extract raster values at the locations of the logbook points
+acov <- terra::extract(asdmr,dat_sf,method='bilinear',ID=F) |> 
+  mutate(lat=dat_sf$lat_1D,lon=dat_sf$lon_1D) |> 
+  pivot_longer(-c(lon,lat),names_to="my",values_to="suit") |> 
+  filter(my %in% yrsmths$my) |> 
+  distinct()
+
+adepth <- terra::extract(asdmd,dat_sf,method='bilinear',ID=F) |> 
+  mutate(lat=dat_sf$lat_1D,lon=dat_sf$lon_1D) |> 
+  pivot_longer(-c(lon,lat),names_to="my",values_to="d.suit") |> 
+  filter(my %in% yrsmths$my) |> 
+  distinct()
+# 
+# acov2 <- acov |> mutate(ridx_y=row_number())
+# datfilt2 <- datfilt |> 
+#   mutate(ridx_x=row_number())
+datj <- dat_sf |>
+  st_set_geometry(NULL) |> 
+  left_join(acov,by=join_by(lon_1D==lon,lat_1D==lat,my)) |> 
+  left_join(adepth,by=join_by(lon_1D==lon,lat_1D==lat,my)) |> 
+  filter(!is.na(suit))
+```
+
+Add habitat suitability as a covariate by joining the data. One issue here is that the albacore SDM data only span 2004-2013, so we need to filter out some data. Or, alternatively, we could just calculate an average suitability over time (a climatology), and use that for all data.
+
+```{r}
+# correlated??
+datj |> 
+  ggplot(aes(suit,mean_logCPUE))+
+  geom_point(size=0.25)+
+  geom_smooth(method='lm')
+
+datj |> 
+  ggplot(aes(d.suit,mean_logCPUE))+
+  geom_point(size=0.25)+
+  geom_smooth(method='lm')
+```
+
+This also introduces a spatial imbalance-- seemingly because of a shift in the fishery footprint in the mid 2000s, there are very few records west of 200 (i.e., 160W). For now, let's proceed by removing those records.
+
+```{r}
+## longitudinal imbalance
+datj |> 
+  mutate(lon360=lon_1D%%360) |> 
+  ggplot(aes(lon360))+
+  geom_histogram()
+
+# filter
+datj <- datj |> 
+  mutate(lon360=lon_1D%%360) |> 
+  filter(lon360>195)
+```
+
+Last cleaning of covariates
+
+```{r}
+datj <- datj |> 
+  # scale year covariate by decade, centered on the mean
+  mutate(scaled_year=(year-mean(year))/10) |> 
+  # scale suitable depth covariate
+  mutate(scaled_d.suit=(d.suit-mean(d.suit))/sd(d.suit)) |> 
+  # I think the data are maybe log10(CPUE+1)?? According to Muhling et al. (2019)
+  # So, to reverse this for testing purposes
+  mutate(cpue=10^mean_logCPUE)
+```
+
+
+### Project data
+
+Project to an planar, azimuthal equal distance projection, to measure distances more accurately when building our models. This is an important step to make sure that spatial relationships in the models are estimated correctly.
+
+```{r}
+# Custom azimuthal equidistant crs, centered around the median lat/lon of the data
+aeqd_crs <- st_crs("+proj=aeqd +lat_0=45 +lon_0= -127 +datum=WGS84 +units=m +no_defs")
+
+datproj <- datj |> 
+  st_as_sf(coords=c("lon_1D","lat_1D"),crs=4326) |> 
+  st_transform(aeqd_crs)
+plot(st_geometry(datproj))
+xykm <- st_coordinates(datproj)/1000
+
+datproj <- datproj |> 
+  mutate(Xkm=xykm[,1],Ykm=xykm[,2])
+```
+
+### Make mesh
+
+Now we make an SPDE mesh. This is the mesh that will serve as the basis for calculation of our spatial and spatiotemporal fields. Plotted here are the mesh points, with the locations of observed data plotted in the small points underneath.
+
+```{r}
+datm <- datproj |> st_set_geometry(NULL)
+mesh1 <- make_mesh(datm,xy_cols = c("Xkm","Ykm"),n_knots = 150)
+plot(mesh1)
+```
+
+Now, we can start to fit some models.
+
+## Fit simple model
+
+In the first test, we fit a model that estimates log CPUE as a combination of an intercept spatial field, a spatiotemporal field for each year, and the suitability covariate.
+
+```{r}
+m1 <- sdmTMB(
+  mean_logCPUE ~ suit,
+  # cpue ~ scaled_year,
+  data = datm,
+  mesh = mesh1, 
+  # family = Gamma(),
+  # spatial random field
+  spatial = "on",
+  spatiotemporal = "iid",
+  time="year"
+)
+```
+
+Quick checks- did the model run okay? What are the general parameter estimates?
+
+```{r}
+# did it run ok?
+sanity(m1)
+# general summary
+summary(m1)
+# main fixed effects
+tidy(m1,"fixed")
+# random effect paramters
+tidy(m1,"ran_pars")
+```
+
+In these outputs, the main or fixed effects are the intercept and, in this case, the linear effect of albacore habitat suitability on logCPUE. The `ran_pars` are the random effects, and include the spatial range (a derived parameter that defines the distance at which 2 points are effectively independent), the scale of observation error (`phi`), and the standard deviations of the different spatial fields, explained further below.
+
+### Make prediction grid
+
+To visualize model output, we project the model on to a spatial grid covering our study area. Let's make the grid.
+
+```{r}
+locs <- mesh1$mesh$loc[,c(1,2)] |> 
+  as_tibble(.name_repair = ~ c("Xkm", "Ykm")) |> 
+  mutate(X=Xkm*1000,Y=Ykm*1000) |> 
+  st_as_sf(coords=c("X","Y"),crs=aeqd_crs)
+ggplot(locs)+geom_sf()
+```
+
+
+```{r}
+# make an outline around the data, using a concave hull
+hull <- st_concave_hull(st_union(datproj),allow_holes=F,ratio=0.8)
+
+# now make a grid and intersect it with the outline, to only keep areas
+# near the data. For now, the resolution is 60km (6e4 meters)
+npgr <- st_make_grid(hull,square=T,cellsize = 6e4)
+ints <- st_intersects(npgr,hull)
+npgr <- npgr[lengths(ints)>0,]
+
+ggplot()+geom_sf(data=npgr,fill=NA)+geom_sf(data=hull,fill=NA,color="blue")+
+  geom_sf(data=datproj,color='red',alpha=0.5)
+```
+
+To project the model, we just need a grid like this as a dataframe, with spatial coordinates and any necessary covariates. We want to duplicate this grid for each month/year in the data, and then add/extract the albacore covariate.
+
+```{r}
+# extract the grid cell centers
+gr <- npgr |>
+  sf::st_centroid() |>
+  sf::st_coordinates() |>
+  as_tibble() |> 
+  # add km columns
+  mutate(Xkm=X/1000,Ykm=Y/1000)
+```
+
+Duplicate the grid for each combination of year/month in the original logbook data, and then extract the albacore SDM covariate onto that grid.
+
+```{r}
+# prediction grid coords in lat/lon, to match to SDM raster
+grll <- npgr |> 
+  st_transform(crs(asdmr)) |> 
+  # get grid cell centers
+  st_centroid() |> st_coordinates() |> 
+  as_tibble() |> 
+  mutate(X=X %% 360)
+
+# now replicate the grid for each combo of year/month in the data
+# while simultaneously extracting data from the right layer of the albacore SDM
+gr_yrs <- map(yrsmths$my, \(x){
+  suitr <- asdmr[x]
+  suitd <- terra::extract(suitr,grll,method='bilinear',ID=F) |> 
+    rename(suit=1)
+  out <- gr |> mutate(suit=suitd$suit,my=x)
+  out
+}) |> bind_rows()
+
+grpred <- gr_yrs |> 
+  separate(ym, into = c("month", "year"), sep = "_") |> 
+  mutate(year = as.numeric(year)) |> 
+  mutate(scaled_year=(year - mean(datj$year)) / 10)
+```
+
+### Make predictions
+
+Now we can project the model.
+
+```{r}
+pred <- predict(m1)
+
+pred <- pred |> 
+  rename(year_trend=zeta_s_scaled_year)
+```
+
+### Plot spatial trends
+
+Mapping function we can use to generically map a variable of interest.
+
+```{r}
+quickmap <- function(dat, column = est) {
+  ggplot(dat, aes(Xkm, Ykm, fill = {{ column }})) +
+    geom_raster() +
+    coord_fixed() +
+    scale_fill_gradient2()
+}
+```
+
+First, we look at the primary spatial field (i.e., the spatial intercept) for the pre-2006 period. There's a clear spatial pattern here, of more fishing in the east and west (blue areas), and much less in the middle of the domain (red areas).
+
+```{r,warning=F}
+quickmap(pred,omega_s)+
+  labs(title="Pre-2006 Spatial Field")
+```
+And here is the deviation from that field for the post-2005 period. In this period, we see relatively more fishing in most places, including in the middle of the domain. Slightly negative effect right near the US West Coast.
+
+```{r,warning=F}
+quickmap(pred,zeta_s_regimeR2)+
+  labs(title="Post-2006 Spatial Field")
+```
+
+However, we also estimated a spatially-varying trend on year. This is the spatial time trend, separate from the other random fields above and separate from the scalar time trend. This actually looks a lot like the pre-2006 spatial field, and describes the linear effect of time on CPUE in different spatial areas.
+
+```{r,warning=F}
+quickmap(pred,year_trend)+labs(title="Spatial Time Trend")
+```
+
+If we wanted the effect of year that includes both the spatial field and the scalar trend, we can calculate that:
+
+```{r,warning=F}
+coefs <- tidy(m1,conf.int = T)
+scaled_year_coef <- coefs$estimate[coefs$term == "scaled_year"]
+pred |> 
+  mutate(year_effect=scaled_year_coef+year_trend) |>
+  quickmap(year_effect)+
+  labs(title="Spatial Plus Linear Time Trend")
+```
+
+We can also look at the uncertainty around these "spatially-varying coefficients", using draws from the joint precision matrix of the parameters. For example, for the spatial effect post-2005:
+
+```{r,warning=F}
+set.seed(890413)
+# simulate 200 draws from the joint precision matrix, focusing on varying the regime effect
+psim <- predict(m1, newdata = gr_yrs, nsim = 200, sims_var = "zeta_s_regimeR2",return_tmb_report=T)
+se_zeta_yr <- map(psim,\(x) pluck(x,"proj_zeta_s_A")[,2,]) |> simplify2array()
+pred$se_zeta_yr <- apply(se_zeta_yr,1,sd)
+quickmap(pred,se_zeta_yr)+
+  scale_fill_viridis_c()+
+  labs(title="SE of Post-2006 Spatial Field")
+rm(psim)
+```
+
+Together, we can plot the stacked effect of all random spatial fields by year. This is the intercept spatial field, plus the "regime" (pre vs. post-2006) spatial effect, plus the spatial time trend. This does not include the scalar time trend.
+
+```{r,warning=F,fig.height=7.5,fig.width=7.5}
+quickmap(pred,est_rf)+
+  facet_wrap(~year)+
+  labs(title="All Spatial Fields Combined")
+```
+
+For comparison, here are the non-spatial effects. This is the scalar intercept plus the scalar time trend (i.e, from the estimated main effects `tidy(m1)`). We can see that these are non-spatial (same value everywhere in a given year).
+
+```{r,warning=F}
+quickmap(pred,est_non_rf)+
+  facet_wrap(~year)+
+  labs(title="Non-Spatial Effects")
+```
+
+### Plot CPUE predictions
+
+Adding everything together, these are the actual CPUE predictions by year
+
+```{r,warning=F,fig.width=7.5,fig.height=7.5}
+quickmap(pred,est)+
+  scale_fill_viridis(option="D")+
+  facet_wrap(~year)+
+  labs(title= "Model 1 Estimated log CPUE")
+```
+
+In (somewhat) natural space, if these values represent log10(CPUE)
+
+```{r,warning=F,fig.width=7.5,fig.height=7.5}
+pred |> 
+  group_by(Xkm,Ykm,year,regime) |> 
+  summarise(est=mean(est),.groups='drop') |> 
+  mutate(est10=10^est) |> 
+  quickmap(est10)+
+  facet_wrap(~year)+
+  scale_fill_viridis(option='D',trans="sqrt")+
+  labs(title= "Model 1 Estimated CPUE")
+```
+
+Uncertainty on the CPUE predictions
+
+```{r,warning=F,fig.height=7.5,fig.width=7.5}
+psim <- predict(m1, newdata = gr_yrs, nsim = 200, sims_var = "est")
+pred$se <- apply(psim, 1, sd)
+quickmap(pred,se)+
+  scale_fill_viridis(option="D")+
+  facet_wrap(~year)+
+  labs(title= "Model 1 SE log CPUE")
+```
+
+### Predicted vs. Observed
+
+To perform some diagnostic checks on the model, we want to do some spatial and non-spatial residual checking, and look at the relationship between predicted vs. observed CPUE values. We start by using the model to predict the original data points.
+
+```{r}
+predobs <- predict(m1) |> 
+  mutate(est10=10^est)
+# calculate SE
+psim <- predict(m1,nsim=200)
+predobs$se_est <- apply(psim,1,sd)
+
+predobs |> 
+  ggplot(aes(mean_logCPUE,est,ymax=est+se_est,ymin=est-se_est))+
+  geom_pointrange(size=0.25,alpha=0.5)+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, log CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+
+predobs |> 
+  ggplot(aes(cpue,est10,ymax=10^(est+se_est),ymin=10^(est-se_est)))+
+  geom_pointrange(size=0.25,alpha=0.5)+
+  geom_rug()+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+```
+
+Now make a QQ plot using the `DHARMA` package
+
+```{r}
+predobs$resids <- residuals(m1)
+# qqnorm(predobs$resids);abline(0,1)
+
+# with DHARMA
+simresids <- simulate(m1,nsim=200,type = 'mle-mvn')
+dharma_residuals(simresids,m1)
+```
+
+We can look at how those residuals are distributed in space. Here, we would look for model misspecification if there are large, spatially biased areas with consistently positive or negative residuals, suggesting the model is not performing well in certain places.
+
+```{r,fig.width=6,fig.height=5}
+# spatial residuals
+predobs |> 
+  ggplot(aes(Xkm,Ykm,color=resids))+
+  geom_jitter(size=1,width = 100)+
+  coord_fixed()+
+  scale_color_gradient2()
+```
+
+This model seems like a pretty good start, but we can explore a couple of other options.
+
+## Model variation - Month/Season
+
+There seems to be significant effects of season, so what if we had a separate spatial field for each group of months, plus a spatial time trend, as above. For now, group the months into May/June, July/Aug/Sep, and Oct/Nov. The idea behind the parameterization is to let the model estimate a linear time trend and a spatial time trend, but also control for the average distribution of fishing across months.
+
+### Month/Season
+
+Add a factor indicator for month groups
+
+```{r}
+datm <- datm |> 
+  mutate(season=case_when(
+    month=="May"|month=="June" ~ "MJ",
+    month%in%c("July","August","September") ~ "JAS",
+    month %in% c("October","November") ~ "ON"
+  )) |> 
+  mutate(seasonfct=factor(season,levels=c("MJ","JAS","ON")))
+```
+
+Now fit the model
+
+```{r}
+m2 <- sdmTMB(
+  mean_logCPUE ~ scaled_year, 
+  data = datm,
+  mesh = mesh1, 
+  family = gaussian(link="identity"),
+  # spatial random field
+  spatial = "on",
+  # NO spatiotemporal field. Instead, spatially varying coefficients on year and month
+  spatial_varying = ~ 1 + scaled_year + seasonfct
+)
+```
+
+As with the first model above, we can perform a series of initial checks on model performance. Unlike Model 1 that has two spatial fields for pre- and post-2006, this model has three spatial fields for the three groups of months.
+
+```{r}
+# did it run ok?
+sanity(m2)
+# quick summary
+summary(m2)
+# main fixed effects
+tidy(m2,"fixed")
+# random effect paramters
+tidy(m2,"ran_pars")
+```
+
+### Make predictions
+
+Predict to the regular grid. We need a new (larger) grid that includes all three groups of months for each year. So, this prediction dataframe will be three times the size of the one used for Model 1 above, because we are adding the effect of months within years.
+
+```{r}
+yrs_season <- crossing(seasonfct=unique(datm$seasonfct),year=unique(datm$year)) |> 
+  mutate(scaled_year=(year-mean(year))/sd(year))
+gr_ssn_yrs <- map(1:nrow(yrs_season),\(x) gr |> bind_cols(yrs_season[x,])) |> bind_rows()
+```
+
+Now predict.
+
+```{r}
+pred2 <- predict(m2,newdata=gr_ssn_yrs)
+pred2 <- pred2 |> 
+  rename(year_svc=zeta_s_scaled_year)
+```
+
+### Spatial fields
+
+We do not have regime now, so the spatial fields are the intercept, a deviation from that intercept for each block of months, and the spatial time trend. First, the spatial intercept, which includes the first factor level of season (i.e., May/June):
+
+```{r,warning=F}
+quickmap(pred2,omega_s)+
+  labs(title="May/June Spatial Field")
+```
+The deviation for July/August/September.
+
+```{r,warning=F}
+quickmap(pred2,zeta_s_seasonfctJAS)+
+  labs(title="July/August/September Spatial Field")
+```
+
+And for October/November.
+
+```{r,warning=F}
+quickmap(pred2,zeta_s_seasonfctON)+
+  labs(title="October/November Spatial Field")
+```
+
+### Spatial trends
+
+Now, the spatial time trend again, including the scalar time trend. But now (as opposed to model 1), we have "factored out" the season spatial fields.
+
+```{r,warning=F}
+coefs <- tidy(m2,conf.int = T)
+scaled_year_coef <- coefs$estimate[coefs$term == "scaled_year"]
+pred2 |> 
+  mutate(year_effect=scaled_year_coef+year_svc) |>
+  quickmap(year_effect)+
+  labs(title="Spatial Plus Linear Time Trend")
+```
+
+All random spatial fields together, by month across years.
+
+```{r,warning=F,fig.width=7.5}
+pred2 |>
+  group_by(Xkm,Ykm,seasonfct) |> 
+  summarise(est_rf=mean(est_rf),.groups='drop') |> 
+  quickmap(est_rf)+
+  labs(title="All Spatial Fields")+facet_wrap(~seasonfct)
+```
+
+### CPUE predictions
+
+Mean predicted CPUE by month across years:
+
+```{r,fig.width=7.5}
+pred2 |> 
+  group_by(Xkm,Ykm,seasonfct) |> 
+  summarise(est=mean(est),.groups='drop') |> 
+  quickmap(est)+
+  scale_fill_viridis(option="D")+
+  labs(title="Model 2 Mean log CPUE")+
+  facet_wrap(~seasonfct)
+```
+
+Uncertainty
+
+```{r,warning=F,fig.width=7.5,fig.height=7.5}
+psim <- predict(m2, newdata = gr_ssn_yrs, nsim = 200, sims_var = "est")
+pred2$se <- apply(psim, 1, sd)
+quickmap(pred2,se)+
+  scale_fill_viridis(option="D")+
+  labs(title="Model 2 SE log CPUE")+
+  facet_wrap(~year)
+```
+
+### Predicted/observed
+
+Again, for model checks we predict to the original data points
+
+```{r,warning=F}
+predobs <- predict(m2)
+psim <- predict(m2,nsim=200)
+predobs$se_est <- apply(psim,1,sd)
+
+predobs |> 
+  ggplot(aes(mean_logCPUE,est,ymax=est+se_est,ymin=est-se_est))+
+  geom_pointrange(size=0.25,alpha=0.5)+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, log CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+
+predobs |> 
+  ggplot(aes(exp(mean_logCPUE),exp(est),ymax=exp(est+se_est),ymin=exp(est-se_est)))+
+  geom_pointrange(size=0.25,alpha=0.5)+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+```
+
+QQ plot
+
+```{r}
+predobs$resids <- residuals(m2)
+# qqnorm(predobs$resids);abline(0,1)
+
+# with DHARMA
+simresids <- simulate(m2,nsim=200,type = 'mle-mvn')
+dharma_residuals(simresids,m2)
+```
+
+## Model variation - spatiotemporal
+
+For a 3rd model to compare, we fit a separate spatial field for each year - a spatiotemporal field. These could be correlated (e.g., AR1 or random walk) or independent (IID). We keep them independent for now. The spatiotemporal fields represent annual deviations from the other spatial fields.
+
+Model 3 estimates a scalar intercept, a scalar time trend, a baseline spatial field, IID spatiotemporal fields for each year, and we retain the spatial fields for each group of months. In this model we also allow anisotropy (`anisotropy = T`), which means that the underlying spatial process can have a larger range (i.e., correlation range) in one spatial direction than another.
+
+```{r}
+m3 <- sdmTMB(
+  mean_logCPUE ~ scaled_year,
+  data = datm,
+  mesh = mesh1, 
+  family = gaussian(link="identity"),
+  # spatial random field
+  spatial = "on",
+  spatiotemporal = "iid",
+  anisotropy = T,
+  time="year",
+  # we still have a spatial field by season
+  spatial_varying = ~ 1 + seasonfct
+)
+```
+
+Quick model checks
+
+```{r}
+# did it run ok?
+sanity(m3)
+# quick summary
+summary(m3)
+# main fixed effects
+tidy(m3,"fixed")
+# random effect paramters
+tidy(m3,"ran_pars")
+```
+We can look at the estimated anisotropy, showing that this model has the highest range (i.e., largest de-correlation distance) in the NW/SE direction (141 degrees on the compass).
+
+```{r}
+plot_anisotropy(m3)
+```
+
+### Make predictions
+
+To predict, we can use the same grid as Model 2.
+
+```{r}
+pred3 <- predict(m3,newdata=gr_ssn_yrs)
+```
+
+### Spatial and spatiotemporal fields
+
+This model has a baseline spatial field, representing the May/June spatial intercept. Then, there are spatiotemporal fields (`epsilon_st`) for each year, and a field for July/Aug/Sep and October/November.
+
+First, the May/June spatial field:
+
+```{r,warning=F}
+quickmap(pred3,omega_s)+
+  labs(title="May/June Spatial Field")
+```
+
+July/Aug/Sep:
+
+```{r,warning=F}
+quickmap(pred3,zeta_s_seasonfctJAS)+
+  labs(title="July/August/September Spatial Field")
+```
+
+October/November
+
+```{r,warning=F}
+quickmap(pred3,zeta_s_seasonfctON)+
+  labs(title="October/November Spatial Field")
+```
+
+And now, the spatiotemporal fields, by year
+
+```{r,fig.width=7.5,fig.height=7.5}
+quickmap(pred3,epsilon_st)+
+  facet_wrap(~year)+
+  labs(title="Annual Spatiotemporal Fields")
+```
+
+And the same, but adding the scalar year effect
+
+```{r,fig.width=7.5,fig.height=7.5}
+coefs <- tidy(m3,conf.int = T)
+scaled_year_coef <- coefs$estimate[coefs$term == "scaled_year"]
+pred3 |> 
+  mutate(year_effect=scaled_year_coef*scaled_year+epsilon_st) |>
+  quickmap(year_effect)+facet_wrap(~year)+
+  labs(title="Annual Spatiotemporal Fields\nand Linear Time Trend")
+```
+
+### CPUE predictions
+
+Predictions
+
+```{r,warning=F,fig.width=7.5,fig.height=24}
+quickmap(pred3,est)+facet_grid(year~seasonfct)+
+  scale_fill_viridis(option="D")+
+  labs(title="Model 3 log CPUE")
+```
+
+And uncertainty
+
+```{r,fig.width=7.5,fig.height=24}
+psim <- predict(m3, newdata = gr_ssn_yrs, nsim = 200, sims_var = "est")
+pred3$se <- apply(psim, 1, sd)
+quickmap(pred3,se)+
+  facet_grid(year~seasonfct)+
+  scale_fill_viridis(option="D")+
+  labs(title="Model 3 SE log CPUE")
+```
+
+### Predicted/observed
+
+As with the other models, we can compare predicted to observed and look for any issues with residuals.
+
+```{r}
+predobs <- predict(m3)
+psim <- predict(m3,nsim=200)
+predobs$se_est <- apply(psim,1,sd)
+
+predobs |> 
+  ggplot(aes(mean_logCPUE,est,ymax=est+se_est,ymin=est-se_est))+
+  geom_pointrange(size=0.25,alpha=0.5)+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, log CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+
+predobs |> 
+  ggplot(aes(10^mean_logCPUE,10^est))+
+  geom_point(size=0.25,alpha=0.5)+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+```
+
+These are smoothed histograms of the distribution of CPUE in the data ("observed") vs. the fitted model ("estimated"). We can see that the model is still a little bit "mean-centered" (i.e., the estimated values have a smaller variance), with not as many extreme values on the high or low end.
+
+```{r}
+predobs |> 
+  dplyr::select(observed=mean_logCPUE,estimated=est) |> 
+  pivot_longer(everything(),names_to="type",values_to="logCPUE") |> 
+  ggplot(aes(logCPUE,fill=type))+geom_density(alpha=0.5)
+predobs |> 
+  dplyr::select(observed=mean_logCPUE,estimated=est) |>
+  pivot_longer(everything(),names_to="type",values_to="logCPUE") |> 
+  mutate(cpue=10^logCPUE) |> 
+  ggplot(aes(cpue,fill=type))+geom_density(alpha=0.5)
+```
+
+### COG
+
+We can also use our model to estimate the center of gravity in each year, representing the centroid of fishing activity.
+
+```{r}
+# predcog <- predict(m3,newdata=gr_ssn_yrs,nsim=200)
+# m3cogY <- get_range_edge(predcog,axis=gr_ssn_yrs$Ykm,quantiles=c(0.025,0.50,0.975))
+# m3cogX <- get_range_edge(predcog,axis=gr_ssn_yrs$Xkm,quantiles=c(0.025,0.50,0.975))
+# m3cog <- m3cogY |> 
+#   mutate(axis="Y") |> 
+#   bind_rows(mutate(m3cogX,axis="X"))
+# m3cog |> 
+#   ggplot(aes(year,est,ymax=upr,ymin=lwr,fill=factor(quantile)))+
+#   geom_ribbon()+
+#   geom_line()+
+#   facet_wrap(~axis,scales='free')
+```
+
+```{r}
+predcog2 <- predict(m3,newdata=gr_ssn_yrs,return_tmb_object=T)
+m3cog <- get_cog(predcog2,format="wide")
+m3cog2 <- get_cog(predcog2)
+
+# in 1D
+m3cog2 |> 
+  ggplot(aes(year,est,ymax=upr,ymin=lwr))+
+  geom_ribbon(fill="blue",alpha=0.5)+
+  geom_line()+
+  labs(title="COG over time")+
+  facet_wrap(~coord,scales='free',nrow=2)
+
+# in 2D
+m3cog |> 
+  mutate(xend=lead(est_x),yend=lead(est_y)) |> 
+  ggplot(aes(est_x,est_y,xend=xend,yend=yend,color=year))+
+  geom_segment(linewidth=1,arrow=arrow(type = 'closed',length=unit(0.25,'cm')))+
+  geom_point()+
+  coord_fixed()+
+  scale_color_viridis()+
+  labs(title="COG over time",x="Xkm",y="Ykm")
+```
+
+It appears that the center of fishing activity has varied over time, but in more recent years has shifted in a northeast direction.

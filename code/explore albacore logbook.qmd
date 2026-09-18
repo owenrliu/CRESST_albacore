@@ -1,0 +1,224 @@
+---
+title: "Explore Albacore Logbook Data"
+format: html
+toc: true
+toc_float: true
+toc-title: "Navigation"
+embed-resources: true
+editor: source
+knitr:
+  opts_chunk:
+    echo: FALSE
+---
+
+## Purpose
+
+Visualize and explore the non-confidential albacore logbook data, obtained 06 April 2026. Look at total data availability, plot patterns.
+
+```{r,warning=F,message=F}
+library(tidyverse)
+library(terra)
+library(sf)
+library(viridis)
+library(here)
+library(rnaturalearth)
+
+tm <- theme_minimal()+theme(panel.border = element_rect(fill=NA,color='black'))
+theme_set(tm)
+```
+
+## Basemap
+
+```{r,message=F,warning=F}
+sf_use_s2(FALSE)
+bg <- ne_countries(scale = "medium", returnclass = "sf") |> st_make_valid()
+
+# Deal with the dateline problem
+# Define the two hemispheres as clipping polygons
+wh <- st_bbox(c(xmin = -180, ymin = -90, xmax = 0, ymax = 90),
+                    crs = 4326) |> st_as_sfc()
+eh <- st_bbox(c(xmin = 0, ymin = -90, xmax = 180, ymax = 90),
+                    crs = 4326) |> st_as_sfc()
+
+# Clip each hemisphere separately, then recombine and shift
+bgw <- st_crop(bg, wh)
+bge <- st_crop(bg, eh)
+
+bg <- rbind(bgw, bge) |>
+  st_shift_longitude()
+bg <- bg[st_is_valid(bg),]
+```
+
+## Load data
+
+```{r}
+dat <- read_csv(here('data','logbook','monthly_1D_albacore_logbook_nonconfidential_Apr2026.csv')) |> 
+  select(-1)
+dprop <- read_csv(here('data','logbook','monthly_1D_albacore_logbook_propRemoved_Apr2026.csv')) |> 
+  select(-1)
+```
+
+## Time series
+
+### Total pixels
+
+Number of (1x1 degree) grid cells with data, over time. This gives a sense of the total number of data points we would have for any analysis by year/month/etc.
+
+```{r}
+p_ndata <- dat |> 
+  group_by(month) |> 
+  summarise(n_pixels=n(),.groups = 'drop') |> 
+  ggplot(aes(month,n_pixels))+
+  geom_line()+
+  geom_point()+
+  labs(x="Year-Month",y="Number of Cells")
+p_ndata
+```
+
+By month across years
+
+```{r}
+p_ndatam <- dat |> 
+  group_by(month) |> 
+  summarise(n_pixels=n(),.groups = 'drop') |> 
+  rename(date=month) |> 
+  mutate(year=year(date),month=month(date)) |> 
+  ggplot(aes(factor(month),n_pixels))+
+  geom_boxplot()+
+  labs(x="Month",y="Number of Cells")
+p_ndatam
+```
+
+### Mean CPUE
+
+```{r}
+mean_cpue_yr <- dat |> 
+  rename(date=month) |> 
+  mutate(year=year(date),month=month(date)) |> 
+  group_by(year) |> 
+  summarise(cpue=mean(mean_logCPUE),sd.cpue=sd(mean_logCPUE),.groups = 'drop') |> 
+  mutate(upr=cpue+1.96*sd.cpue,lwr=cpue-1.96*sd.cpue)
+mean_cpue_month <- dat |> 
+  rename(date=month) |> 
+  mutate(year=year(date),month=month(date)) |> 
+  group_by(month) |> 
+  summarise(cpue=mean(mean_logCPUE),sd.cpue=sd(mean_logCPUE),.groups = 'drop') |> 
+  mutate(upr=cpue+1.96*sd.cpue,lwr=cpue-1.96*sd.cpue)
+p_cpue_yr <- mean_cpue_yr |> 
+  ggplot(aes(year,cpue,ymax=upr,ymin=lwr))+
+  geom_pointrange()+
+  labs(x="Year",y="CPUE")
+p_cpue_mth <- mean_cpue_month |> 
+  ggplot(aes(month,cpue,ymax=upr,ymin=lwr))+
+  geom_pointrange()+
+  labs(x="Month",y="CPUE")
+p_cpue_yr
+p_cpue_mth
+```
+
+### Catch centroids
+
+CPUE-weighted centroid of fishing activity
+
+```{r}
+cog_ts <- dat |> 
+  # convert longitude to 360 degree
+  mutate(lon360=lon_1D%%360) |> 
+  group_by(month) |> 
+  summarise(meanlon=weighted.mean(lon360,mean_logCPUE),
+            meanlat=weighted.mean(lat_1D,mean_logCPUE),.groups='drop')
+pcog <- cog_ts |>
+  pivot_longer(contains("mean"),names_to="direction",values_to="centroid") |> 
+  ggplot(aes(month,centroid))+
+  geom_line()+
+  facet_wrap(~direction,scales='free')
+pcog
+
+pcogm <- cog_ts |>
+  pivot_longer(contains("mean"),names_to="direction",values_to="centroid") |> 
+  mutate(m=month(month),y=year(month)) |> 
+  ggplot(aes(y,centroid))+
+  geom_line()+
+  facet_grid(m~direction,scales='free')
+pcogm
+```
+
+
+## Maps
+
+1x1-degree grid
+
+```{r}
+dat_sf <- dat |> st_as_sf(coords=c("lon_1D","lat_1D"),crs=4326,remove=F) |> 
+  st_shift_longitude()
+bb <- st_bbox(dat_sf)
+```
+
+```{r}
+# Extent offset by 0.5 so cell centers land on whole-number degrees
+r <- rast(
+  xmin = 161.5,
+  xmax = 242.5,
+  ymin = 30.5,
+  ymax = 54.5,
+  resolution = c(1, 1),
+  crs = "EPSG:4326"
+)
+
+datr <- map(sort(unique(dat_sf$month)),\(x){
+  dsub <- dat_sf |> filter(month==x)
+  rasterize(dsub,r,field="mean_logCPUE")
+})
+nms <- dat |> 
+  arrange(month) |> 
+  mutate(month_name=month.name[month(month)],year=year(month)) |> 
+  unite(lyrn,month_name,year) |> 
+  distinct(lyrn) |> 
+  pull(lyrn)
+nms <- paste(1:length(nms),nms,sep="_")
+datr <- sds(datr)
+names(datr) <- nms
+```
+
+
+```{r,warning=F}
+library(tidyterra)
+bgc <- bg |> st_crop(bb)
+
+make_plot_mth <- function(inrast,lyr_name){
+  ggplot()+
+    geom_spatraster(data=inrast)+
+    scale_fill_viridis(na.value=NA,limits=c(0,3))+
+    geom_sf(data=bgc)+
+    labs(fill="log CPUE",title=lyr_name) 
+}
+# make_plot_mth(datr[[1]],names(datr)[[1]])
+```
+
+Make all plot, then make a gif
+
+```{r}
+iwalk(datr,\(x,idx) {
+  p <- make_plot_mth(x,idx)
+  ggsave(here('plots','logbook cpue',paste0(idx,".png")),p,w=6,h=5)
+})
+```
+
+Make a gif
+
+```{r}
+library(magick)
+pngs <- list.files(here('plots','logbook cpue'),pattern = "\\.png$", full.names = TRUE)
+ord <- regmatches(pngs, gregexpr("(?<=/)\\d+(?=_)", pngs, perl = TRUE)) |> 
+  unlist() |> as.integer()
+pngs_ord <- match(sort(ord),ord)
+pngs <- pngs[pngs_ord]
+
+frames <- image_read(pngs)
+
+# Combine into a GIF and save
+animation <- image_animate(frames, fps = 2)  # adjust fps as needed
+image_write(animation, here('plots','logbook cpue',"logbook_cpue.gif"))
+```
+
+

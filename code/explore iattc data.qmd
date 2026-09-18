@@ -33,6 +33,7 @@ psdt <- read_csv(here('data','PublicPSTunaSetType.csv'))
 # flag codes
 flags <- read_csv(here('data','flag_codes.csv'))
 ```
+
 ## Simple Time Series
 
 Longline
@@ -92,7 +93,6 @@ pltsalb <- pld |>
 pltsalb
 ```
 
-
 ## Make Spatial Grid
 
 Make a spatial grid to map this information. The longline data is on a 5x5degree grid, while the other datasets are on a 1x1 grid.
@@ -123,8 +123,11 @@ plot_eff <- function(dat,year,month,species){
     dplyr::select(contains("Lon"),contains("Lat"),all_of(species)) |> 
     set_names(c("lon","lat","val"))
   out <- rasterize(df,gr1,values=df$val)
+  plot(out)
 }
-# dat=pld;year=1980;month=4;species="ALB"
+dat=pld;year=1984;month=10;species="ALB"
+
+plot_eff(dat,year,month,species)
 ```
 
 

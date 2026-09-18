@@ -1,0 +1,304 @@
+---
+title: "Albacore FDM Covariate Construction"
+format: html
+toc: true
+toc_float: true
+toc-title: "Navigation"
+embed-resources: true
+editor: source
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Purpose
+
+Extract and calculate albacore habitat suitability covariates from Mary Margaret Stoll's albacore SDM, for use in fishing distribution models.
+
+```{r,warning=F,message=F}
+library(tidyverse)
+library(terra)
+library(sf)
+library(sdmTMB)
+library(viridis)
+library(here)
+library(rnaturalearth)
+
+tm <- theme_minimal()+theme(panel.border = element_rect(fill=NA,color='black'))
+theme_set(tm)
+
+```
+
+## Load data
+
+Albacore logbook data, coarsened to 1 degree resolution. We'll join the albacore SDM covariates to these data.
+
+```{r}
+dat <- read_csv(here('data','logbook','monthly_1D_albacore_logbook_nonconfidential_Apr2026.csv')) |> 
+  select(-1)
+```
+
+
+Albacore SDM data from MM, to be used as a covariate
+
+```{r}
+# non-OIF scenario (i.e., baseline)
+asdm <- read_csv(here('data','albacore sdm','SDM_Output_OIF_Scenarios_091726.csv'))
+```
+
+## Calculate Albacore Covariates
+
+The dynamic covariates are calculated from Stoll et al.'s albacore SDM. The data include, as monthly fields, data on temperature (both depth-matched and sea surface), particulate organic carbon, chlorophyll, and oxygen, as well as the model-predicted probability of occurrence (or habitat suitability), which is our main metric of interest. The data include suitability predictions for a base scenario plus a number of ocean iron fertilization scenarios.
+
+```{r}
+scen_vars <- tibble(v = names(asdm)[grepl("y_pred",names(asdm))]) |> 
+  mutate(scenario=row_number()) |> 
+  mutate(scenario=paste0("scen",scenario))
+names(asdm)[grepl("y_pred",names(asdm))] <- scen_vars$scenario
+```
+
+
+Because the data are 3-D (time by space by depth layer), and we need 2D covariates (time by space), we need to make decisions about how to "flatten" the data at each time point. Sea surface temperature should already be the same across depth. Let's make sure.
+
+```{r}
+# "distinct" (i.e., identifying unique rows) should give us the same answer as summarizing
+# because all of the SST values for a given location/month should be the same
+sst1 <- asdm |>
+  distinct(time,year,month,lon,lat,SST_C) |> 
+  arrange(time,year,month,lon,lat,SST_C)
+sst2 <- asdm |> 
+  select(time,year,month,lon,lat,SST_C) |> 
+  group_by(time,year,month,lon,lat) |> 
+  summarise(SST_C=mean(SST_C),.groups='drop') |> 
+  arrange(time,year,month,lon,lat,SST_C)
+
+# are these the same?
+identical(sst1,sst2)
+```
+
+For derived suitability metrics, a reasonable place to start is to calculate mean and maximum habitat suitability in each grid cell, across depth layers.
+
+```{r}
+suit <- asdm |> 
+  select(time,year,month,lon,lat,depth,contains('scen')) |> 
+  # filter(depth<=200) |>
+  group_by(time,year,month,lon,lat) |> 
+  summarise(across(contains('scen'),list(mean_suit=~mean(.x,na.rm=T),
+                                         max_suit=~max(.x,na.rm=T))),
+            .groups='drop')
+# distributions
+suit |> 
+  slice_sample(n=100000) |> 
+  ggplot(aes(scen1_mean_suit))+
+  geom_density(fill='darkgreen',alpha=0.5)
+suit |> 
+  slice_sample(n=100000) |> 
+  ggplot(aes(scen1_max_suit))+
+  geom_density(fill='darkgreen',alpha=0.5)
+
+# we can see how these two are related
+suit |> slice_sample(n=10000) |> 
+  ggplot(aes(scen1_mean_suit,scen1_max_suit))+
+  geom_point()+
+  geom_abline(slope=1,intercept=0)+
+  geom_smooth(se=F,color='red',linetype = 2)
+```
+
+We can also calculate the depth at which habitat suitability is maximized.
+
+```{r}
+best_depth <- asdm |> 
+  group_by(time,year,month,lon,lat) |>  
+  summarise(across(contains('scen'),list(wdepth= ~depth[which.max(.x)])),
+            .groups='drop')
+
+best_depth |> 
+  slice_sample(n=100000) |> 
+  ggplot(aes(scen5_wdepth))+
+  geom_density(fill='darkgreen',alpha=0.5)
+```
+
+There is sort of a bi-modal distribution of values here.
+
+For now, the last metric we derive is a depth-integrated suitability metric, to try to get a proxy for the total available habitat in a grid cell. We'll calculate this as $$\frac{\sum_{d=1}^{D} s*i}{\sum i}$$, where $d$ is the depth layer ranging from 1 to $D$ with layer thickness $i$, and $s$ is suitability in depth layer $d$.
+
+```{r}
+# calculate thickness of each depth layer
+d.key <- tibble(depth=sort(unique(asdm$depth))) |> 
+  mutate(thickness=lead(depth)-depth) |> 
+  mutate(thickness=replace_na(thickness,0))
+
+intsuit <- asdm |> 
+  left_join(d.key,by=join_by(depth)) |>
+  group_by(time,year,month,lon,lat) |>   
+  summarise(across(contains('scen'),list(int_suit= ~sum(.x*thickness)/sum(thickness))),
+            .groups='drop')
+
+intsuit |> 
+  slice_sample(n=10000) |> 
+  ggplot(aes(scen1_int_suit))+
+  geom_density(fill='darkgreen',alpha=0.5)
+```
+
+Gather all of these covariates together.
+
+```{r}
+covs <- sst1 |> 
+  rename(sst=SST_C) |> 
+  left_join(suit) |> 
+  left_join(intsuit) |> 
+  left_join(best_depth)
+```
+
+Correlations with the main (scenario 1) covariates. As might have been expected, mean suitability is almost perfectly correlated with integrated suitability (since the only difference is the weighting of the slightly different depth layer thicknesses). Max suitability is also highly correlated, but as we saw above, the distribution of the two variables is rather different, and may be worth retaining.
+
+```{r}
+library(ggcorrplot)
+mat <- cor(covs |> select(sst,contains("scen1")))
+ggcorrplot(mat,type='upper',hc.order = T,lab=T)
+```
+
+```{r}
+covs |> slice_sample(n=10000) |> 
+  ggplot(aes(scen1_mean_suit,scen1_int_suit))+
+  geom_point()+
+  geom_abline(slope=1,intercept=0)+
+  geom_smooth(se=F,color='red',linetype = 2)
+```
+
+## Rasterize
+
+Place these covariates into a gridded raster format, so it is easier to perform spatial extractions on them (i.e., to join them to the logbook data).
+
+```{r}
+# make a list of rasters, one for each variable
+# each raster has one layer for each time point (year/month)
+varn <- c("sst",names(covs)[grepl("scen",names(covs))])
+
+# year-month names to label the raster layers
+lyrn <- covs |> 
+  distinct(time,year,month) |>
+  mutate(month=month.name[month]) |> 
+  unite("ym",month,year) |> pull(ym)
+
+# make each variable into a layered raster
+# where the layers are time
+asdmr <- map(varn,\(x){
+  r <- covs |> 
+    select(all_of(c("lon","lat","time",x))) |> 
+    rast(type='xylz',crs="EPSG:4326")
+  names(r) <- lyrn
+  r
+})
+
+# store in a raster dataset, basically a named list, where each element is a variable
+asdmr <- sds(asdmr)
+names(asdmr) <- varn
+```
+
+We can animate and save these rasters for later reference.
+
+```{r,eval=F}
+animation::saveGIF(terra::animate(asdmr$sst,n=1,main=lyrn),here('plots','alb_sst.gif'))
+animation::saveGIF(terra::animate(asdmr$scen1_mean_suit,n=1,main=lyrn),here('plots','alb_meansuit.gif'))
+animation::saveGIF(terra::animate(asdmr$scen1_max_suit,n=1,main=lyrn),here('plots','alb_maxsuit.gif'))
+animation::saveGIF(terra::animate(asdmr$scen1_int_suit,n=1,main=lyrn),here('plots','alb_intsuit.gif'))
+animation::saveGIF(terra::animate(asdmr$scen1_wdepth,n=1,main=lyrn),here('plots','alb_bestdepth.gif'))
+```
+
+## Explore
+
+Does the suitability-weighted center of the distribution vary across months?
+
+```{r}
+asdm_ll_ts <- covs |> 
+  group_by(month) |> 
+  # lat and lon weighted by mean suitability
+  summarise(wlat=weighted.mean(lat,scen1_mean_suit),
+            wlon=weighted.mean(lon,scen1_mean_suit),.groups = 'drop')
+
+asdm_ll_ts |> 
+  arrange(month) |> 
+  mutate(xend=lead(wlon),yend=lead(wlat)) |>
+  ggplot(aes(wlon,wlat,xend=xend,yend=yend,color=month))+
+  geom_segment(linewidth=1,arrow=arrow(type = 'closed',length=unit(0.25,'cm')))+
+  geom_point()+
+  coord_fixed()+
+  scale_color_viridis()+
+  labs(title="Annual Movement in the Center of Suitability",x="Xkm",y="Ykm")
+```
+
+## Join
+
+Now we join the covariates to the logbook data, which will require filtering both datasets since they do not share all years/months in common.
+
+First, add month and year as variables to the logbook data.
+
+```{r}
+# Add a chr month column, to use as a covariate
+dat <- dat |> 
+  rename(date=month) |> 
+  mutate(month=month.name[month(date)]) |>
+  mutate(year=year(date)) |> 
+  # -180 and 180 longitude are equivalent
+  mutate(lon_1D=ifelse(lon_1D==180,-180,lon_1D))
+```
+
+```{r}
+# common year/month combos between datasets
+yrsmths <- distinct(dat,year,month) |> 
+  mutate(month=match(month,month.name)) |> 
+  # only keep common year/month combos
+  inner_join(distinct(covs,year,month),by=join_by(year,month)) |> 
+  mutate(month=month.name[month]) |> 
+  unite("my",month,year,remove=F)
+```
+
+With this year/month key, we can filter both datasets. Now we can extract the covariate data from the raster dataset.
+
+```{r}
+# logbook data as spatial object
+dat_sf <- dat |>
+  unite("my",month,year,remove=F) |> 
+  filter(my %in% yrsmths$my) |> 
+  st_as_sf(coords=c("lon_1D","lat_1D"),crs=4326,remove = F) |> 
+  st_shift_longitude()
+
+# for each year/month, extract raster values at the locations of the logbook points
+acov <- imap(asdmr,\(x,idx){
+  terra::extract(x,dat_sf,method='bilinear',ID=F) |> 
+    mutate(lat=dat_sf$lat_1D,lon=dat_sf$lon_1D) |> 
+    pivot_longer(-c(lon,lat),names_to="my",values_to=idx) |> 
+    filter(my %in% yrsmths$my) |> 
+    distinct()
+}) |> 
+  # reduce by left_joining
+  reduce(left_join,by=join_by(lat,lon,my))
+```
+
+And now join to the logbook data
+
+```{r}
+datj <- dat_sf |>
+  st_set_geometry(NULL) |> 
+  left_join(acov,by=join_by(lon_1D==lon,lat_1D==lat,my)) |> 
+  # and remove rows that didn't spatially match
+  filter(!is.na(scen1_mean_suit))
+```
+
+This is our filtered down dataset that has no missing data.
+
+```{r}
+# save
+write_rds(datj,here('data','logbook_with_sdm_covariates.rds'))
+```
+
+And the full raster output.
+```{r}
+asdml <- as.list(asdmr)
+iwalk(asdml,\(x,idx){
+  writeRaster(x,here('data','albacore sdm',paste0('alb_sdm_',idx,'.tif')),overwrite=T)
+})
+```
+

@@ -1,0 +1,1017 @@
+---
+title: "Albacore Logbook Distribution Models"
+format: html
+toc: true
+toc_float: true
+toc-title: "Navigation"
+embed-resources: true
+editor: source
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Purpose
+
+Build distribution models for the U.S. albacore tuna fishery, using fishery logbook data and covariate data from Mary Margaret Stoll's albacore SDM.
+
+```{r,warning=F,message=F,include=F}
+library(tidyverse)
+library(terra)
+library(sf)
+library(sdmTMB)
+library(viridis)
+library(here)
+library(rnaturalearth)
+library(sdmTMBextra)
+
+tm <- theme_minimal()+theme(panel.border = element_rect(fill=NA,color='black'))
+theme_set(tm)
+
+```
+
+## Preparing to Model
+
+### Prep model data
+
+Most data prep was performed when joining the logbook data to covariates in `make fdm covariates`, but there are some final touches we want to make to the data so it is ready for `sdmTMB`.
+
+```{r}
+dat <- read_rds(here('data','logbook_with_sdm_covariates.rds'))
+
+# remove extra covariate columns (that we'll use later for projection!)
+dat <- dat |> select(lon_1D:sst,contains("scen1")) |> 
+  rename_with(~str_remove(.x,"scen1_"),contains('scen1'))
+```
+
+
+First, seemingly because of a shift in the fishery footprint in the mid 2000s, there are very few records in our dataset west of 200 (i.e., 160W), once the data have been filtered to the overlapping time period from the albacore SDM (2004-2013). We remove these records to constrain the spatial footprint of our model to areas that are more consistently informed by data.
+
+```{r}
+## longitudinal imbalance
+dat <- dat |> 
+  # convert longitude to the 0-360 version
+  mutate(lon360=lon_1D%%360)
+
+dat |> 
+  ggplot(aes(lon360))+
+  geom_histogram()+
+  labs(x="Longitude",y="Number of Records")
+
+# filter
+dat <- dat |> 
+  filter(lon360>195)
+```
+
+Lastly, we scale some covariates to improve their behavior in the model estimation.
+
+```{r}
+dat <- dat |> 
+  # scale year covariate by decade, centered on the mean
+  mutate(scaled_year=(year-mean(year))/10) |> 
+  # scale optimal albacore depth by taking the log
+  mutate(scaled_depth=as.numeric(scale(wdepth)),
+         scaled_sst=as.numeric(scale(sst))) |> 
+  # add a factor indicator for month groups (june/jul, aug/sep, oct/nov)
+  mutate(season=case_when(
+    month%in%c("June","July") ~ "JJ",
+    month%in%c("August","September") ~ "AS",
+    month %in% c("October","November") ~ "ON"
+  )) |> 
+  mutate(seasonfct=factor(season,levels=c("JJ","AS","ON")),
+         monthfct=factor(month,levels=c("June","July","August","September","October","November")))
+```
+
+### Project data
+
+Project to an planar, azimuthal equal distance projection, to measure distances more accurately when building our models. This is an important step to make sure that spatial relationships in the models are estimated correctly.
+
+```{r}
+# Custom azimuthal equidistant crs, centered around the median lat/lon of the data
+aeqd_crs <- st_crs("+proj=aeqd +lat_0=45 +lon_0= -127 +datum=WGS84 +units=m +no_defs")
+
+datproj <- dat |> 
+  st_as_sf(coords=c("lon_1D","lat_1D"),crs=4326) |> 
+  st_transform(aeqd_crs)
+plot(st_geometry(datproj))
+xykm <- st_coordinates(datproj)/1000
+
+# add XY coordinates to the data
+datproj <- datproj |> 
+  mutate(Xkm=xykm[,1],Ykm=xykm[,2])
+```
+
+### Make mesh
+
+Now we make an SPDE mesh. This is the mesh that will serve as the basis for calculation of our spatial and spatiotemporal fields. We use a coastline polygon as a correlation barrier to help us avoid improperly projecting the model onto land.
+
+```{r}
+datm <- datproj |> st_set_geometry(NULL)
+mesh1 <- make_mesh(datm,xy_cols = c("Xkm","Ykm"),cutoff=150)
+```
+
+```{r}
+write_rds(datm,here('data','logbook_data_sdmTMB_ready.rds'))
+```
+
+
+```{r,warning=F}
+coast <- ne_countries(scale='medium',country=c("canada","united states of america")) |> 
+  st_transform(aeqd_crs) |>
+  st_crop(datproj)
+ggplot()+geom_sf(data=coast)+geom_sf(data=datproj)
+```
+
+Make the barrier mesh. The red crosses are the mesh triangles that are on land, and correlation will decay much faster over space in these areas (10x as fast, based on `range_fraction`).
+
+```{r}
+bmesh <- sdmTMBextra::add_barrier_mesh(mesh1,coast,range_fraction = 0.1,proj_scaling=1000)
+```
+
+Here is the mesh we will use.
+
+```{r}
+plot(bmesh)
+```
+
+Now, we can start to fit some models.
+
+## Basic Model Configuration
+
+We want to set up the basic model types we are interested in. Using this structure, we will then set up a cross-validation procedure to test the inclusion of any combination of covariates and select from a suite of candidate models.
+
+For now, we want to explore three main model structures, which we will call Group A, Group B, and Group C models. All model configurations estimate the time-varying distribution of albacore CPUE as a combination of a scalar intercept, one or more environmental covariates (i.e., from the albacore SDM), and or more spatial random fields. The spatial fields represent consistent spatial patterns in the data that are not captured by any environmental covariates we include. Time trends can be estimated spatially (through spatiotemporal fields that track annual deviations from the base spatial field) or non-spatially (through estimating year and/or season effects in the GLMM).
+
+The difference between the main model structures is that in Group A models, there will be a single spatial field representing the mean annual spatial pattern, in addition to annual spatiotemporal fields to capture spatial trends through time. Group B models allow more seasonal resolution and estimate three spatial fields, categorized by two-month periods across the fishing season (June/July, August/September, and October/November). Group C models estimate non-spatial year and season effects instead of spatiotemporal fields, then use spatially-varying coefficients to estimate how the effect of environmental covariates might vary over space.
+
+Let's test a version of each model, using mean albacore habitat suitability `mean_suit` as the only environmental covariate for now.
+
+### Fit
+
+For Group A:
+
+```{r}
+mA1 <- sdmTMB(
+  mean_logCPUE ~ s(mean_suit,k=3),
+  data = datm,
+  mesh = bmesh,
+  spatial = "on",
+  spatiotemporal = "iid",
+  time="year"
+)
+```
+
+For Group B, we add a spatial field for each pair of months using the `spatial_varying` syntax:
+
+```{r}
+mB1 <- sdmTMB(
+  mean_logCPUE ~ s(mean_suit,k=3),
+  data = datm,
+  mesh = bmesh,
+  spatial = "off",
+  spatiotemporal = "iid",
+  spatial_varying = ~ 0+seasonfct,
+  time="year"
+)
+```
+
+And in Group C, time trends are captured with main (non-spatial) effects and `spatiotemporal` is turned off, while environmental covariates are now estimated with spatially-varying coefficients.
+
+```{r}
+mC1 <- sdmTMB(
+  mean_logCPUE ~ s(scaled_year)+seasonfct,
+  data = datm,
+  mesh = bmesh,
+  spatial = "off",
+  spatiotemporal = "off",
+  spatial_varying = ~ 0+mean_suit
+)
+```
+
+
+Quick checks of the model output. Did the model run okay? What are the general parameter estimates?
+
+```{r}
+# did it run ok?
+sanity(mA1)
+# general summary
+summary(mA1)
+# main fixed effects
+tidy(mA1,"fixed")
+# random effect paramters
+tidy(mA1,"ran_pars")
+
+# did it run ok?
+sanity(mB1)
+# general summary
+summary(mB1)
+# main fixed effects
+tidy(mB1,"fixed")
+# random effect paramters
+tidy(mB1,"ran_pars")
+
+# did it run ok?
+sanity(mC1)
+# general summary
+summary(mC1)
+# main fixed effects
+tidy(mC1,"fixed")
+# random effect paramters
+tidy(mC1,"ran_pars")
+```
+
+In these outputs, the main or fixed effects are the intercept and, in this case, the effect of albacore habitat suitability on logCPUE. The `ran_pars` are the random effects, and include the spatial range (a derived parameter that defines the distance at which 2 points are effectively independent), the scale of observation error (`phi`), and the standard deviations of the different spatial fields, explained further below.
+
+### Make prediction grid
+
+To visualize model output, we project the model on to a spatial grid covering our study area. Let's make the grid.
+
+```{r}
+# make an outline around the data points, using a concave hull
+hull <- st_concave_hull(st_union(datproj),allow_holes=F,ratio=0.8)
+
+# now make a grid and intersect it with the outline, to only keep areas
+# near the data. For now, the resolution is 60km (6e4 meters)
+npgr <- st_make_grid(hull,square=T,cellsize = 6e4)
+ints <- st_intersects(npgr,hull)
+npgr <- npgr[lengths(ints)>0,]
+
+#visualize
+ggplot()+
+  geom_sf(data=npgr,fill=NA)+
+  geom_sf(data=hull,fill=NA,color="blue")+
+  geom_sf(data=datproj,color='red',alpha=0.5)
+```
+
+To project the model, we just need a grid like this as a dataframe, with spatial coordinates and any necessary covariates. We want to duplicate this grid for each month/year in the data, and then add/extract the albacore covariates.
+
+```{r}
+# extract the grid cell centers
+gr <- npgr |>
+  sf::st_centroid() |>
+  sf::st_coordinates() |>
+  as_tibble() |> 
+  # add km columns
+  mutate(Xkm=X/1000,Ykm=Y/1000)
+
+
+# write
+write_rds(gr,here('data','predgrid.rds'))
+```
+
+Albacore covariates as a list of rasters.
+
+```{r}
+covn <- c('sst','scen1_mean_suit','scen1_max_suit','scen1_int_suit','scen1_wdepth')
+alb_covs <- map(covn, \(x) rast(here('data','albacore sdm',paste0('alb_sdm_',x,'.tif'))))
+names(alb_covs) <- covn
+```
+
+Now, duplicate the grid for each combination of year/month in the logbook data, and then extract the albacore SDM covariate onto that grid.
+
+```{r}
+# prediction grid coords in lat/lon, to match to SDM raster
+grll <- npgr |> 
+  st_transform(crs(alb_covs[[1]])) |> 
+  # get grid cell centers
+  st_centroid() |> st_coordinates() |> 
+  as_tibble() |> 
+  mutate(X=X %% 360)
+
+# function to pull together a list of raster layers for a given year month
+# and extract them to a given set of points
+
+# Inputs: chr vector of covariate names, month-year (e.g., "March_2013") and pred points
+extract_covariates_my <- function(cov_names,my,pp){
+  covl <- map(cov_names,\(x){
+    d <- alb_covs[[x]][my] |> 
+      terra::extract(pp,method='bilinear',ID=F)
+    names(d) <- x
+    d})
+  out <- covl |>
+    bind_cols() |> 
+    mutate(my=my)
+  out
+}
+# implement function for all year/months in the data to extract all the data
+grmy <- map(unique(datm$my), \(x){
+  covs <- extract_covariates_my(covn,x,grll)
+  gr |> bind_cols(covs)
+}) |> bind_rows()
+```
+
+Here's the final prediction grid with all (correctly scaled) covariates.
+
+```{r}
+grpred <- grmy |> 
+  rename_with(~str_remove(.x,"scen1_"),contains('scen1')) |> 
+  separate(my, into = c("month", "year"), sep = "_") |> 
+  mutate(year = as.numeric(year)) |> 
+  # scale covariates relative to logbook data
+  # to put them on the same scale as the fit
+  mutate(scaled_year=(year - mean(datm$year)) / 10) |> 
+  # scale depth
+  mutate(scaled_depth=(wdepth-mean(datm$wdepth))/sd(datm$wdepth)) |>
+  mutate(scaled_sst=(wdepth-mean(datm$sst))/sd(datm$sst)) |> 
+  filter(!is.na(mean_suit)) |> 
+  # add season factor again
+  mutate(season=case_when(
+    month%in%c("June","July") ~ "JJ",
+    month%in%c("August","September") ~ "AS",
+    month %in% c("October","November") ~ "ON"
+  )) |> 
+  mutate(seasonfct=factor(season,levels=c("JJ","AS","ON")),
+         monthfct=factor(month,levels=c("June","July","August","September","October","November")))
+```
+
+### Make predictions
+
+Now we can project the model. First, for the Group A model.
+
+```{r}
+predA1 <- predict(mA1,newdata=grpred)
+```
+
+### Plot spatial fields
+
+Mapping function we can use to generically map a variable of interest.
+
+```{r}
+quickmap <- function(dat, column = est) {
+  ggplot()+
+    geom_raster(data=dat, aes(Xkm, Ykm, fill = {{ column }})) +
+    coord_fixed() +
+    scale_fill_gradient2()
+}
+```
+
+Primary spatial field
+
+```{r,warning=F}
+quickmap(predA1,omega_s)+
+  labs(title="Spatial Field, Model A1")
+```
+Spatiotemporal fields
+
+```{r,warning=F}
+quickmap(predA1,epsilon_st)+
+  facet_wrap(~year) +
+  labs(title="Annual Spatiotemporal Fields")
+```
+
+For comparison, here are the main effects, not including the random fields. This is the scalar intercept plus the effect of covariates (i.e, from the estimated main effects `tidy(mA1)`).
+
+```{r,warning=F}
+quickmap(predA1,est_non_rf)+
+  facet_wrap(~year)+
+  scale_fill_viridis(option="A")+
+  labs(title="Non-Spatial Effects")
+```
+
+### Plot Covariate Effect
+
+We can visualize conditional covariate effects by projecting the model across a range of the covariate of interest, while holding other variables constant.
+
+```{r}
+dc <- data.frame(
+  mean_suit = seq(min(datm$mean_suit),
+    max(datm$mean_suit),
+    length.out = 100
+  ),
+  year = 2007, # an abitrary year
+  seasonfct="AS"
+)
+pc <- predict(mA1, newdata = dc, se_fit = TRUE, re_form = NA)
+ggplot(pc, aes(mean_suit, est,
+  ymin = est - 1.96 * est_se,
+  ymax = est + 1.96 * est_se)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.4) +
+  scale_x_continuous() +
+  coord_cartesian(expand = F) +
+  labs(x = "Suitability", y = "Conditional Effect")
+```
+
+### Plot CPUE predictions
+
+Adding everything together, these are the actual CPUE predictions by year
+
+```{r,warning=F,fig.height=8,fig.width=8}
+p <- predA1 |>
+  quickmap(est)+
+  facet_grid(year~monthfct)+
+  scale_fill_viridis(option="A")+
+  labs(title= "Model A1: Log CPUE")
+p
+```
+
+Uncertainty on the CPUE predictions. Uncertainty is lower closer to the observed data
+
+```{r,warning=F,fig.height=8,fig.width=8}
+psim <- predict(mA1, newdata = grpred, nsim = 200, sims_var = "est")
+predA1$se <- apply(psim, 1, sd)
+quickmap(predA1,se)+
+  scale_fill_viridis(option="E")+
+  facet_grid(year~monthfct)+
+  labs(title= "Model 1 SE log CPUE")
+```
+
+### Predicted vs. Observed
+
+To perform some diagnostic checks on the model configurations, we want to do some spatial and non-spatial residual checking, and look at the relationship between predicted vs. observed CPUE values. We start by using the model to predict the original data points.
+
+```{r}
+predobs <- predict(mA1) |> 
+  mutate(est10=10^est)
+
+# calculate SE
+psim <- predict(mA1,nsim=200)
+predobs$se_est <- apply(psim,1,sd)
+
+predobs |> 
+  ggplot(aes(mean_logCPUE,est,ymax=est+se_est,ymin=est-se_est))+
+  geom_pointrange(size=0.25,alpha=0.5)+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, log CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+```
+
+Now make a QQ plot using the `DHARMA` package
+
+```{r}
+predobs$resids <- residuals(mA1)
+
+# with DHARMA
+simresids <- simulate(mA1,nsim=200,type = 'mle-mvn')
+dharma_residuals(simresids,mA1)
+```
+
+We can look at how those residuals are distributed in space and time. Here, we would look for model misspecification if there are large, spatially biased areas with consistently positive or negative residuals, suggesting the model is not performing well in certain places.
+
+```{r}
+# spatial residuals
+predobs |> 
+  ggplot(aes(Xkm,Ykm,color=resids))+
+  geom_jitter(size=1,width = 100)+
+  coord_fixed()+
+  scale_color_gradient2()
+```
+
+```{r}
+# temporal residuals
+predobs |> 
+  ggplot(aes(year,resids))+
+  geom_point()+
+  geom_smooth(se=F)
+```
+
+These are smoothed histograms of the distribution of CPUE in the data ("observed") vs. the fitted model ("estimated"). We can see that the model is still a little bit "mean-centered" (i.e., the estimated values have a smaller variance), with not as many extreme values on the high or low end.
+
+```{r}
+predobs |> 
+  dplyr::select(observed=mean_logCPUE,estimated=est) |> 
+  pivot_longer(everything(),names_to="type",values_to="logCPUE") |> 
+  ggplot(aes(logCPUE,fill=type))+geom_density(alpha=0.5)
+predobs |> 
+  dplyr::select(observed=mean_logCPUE,estimated=est) |>
+  pivot_longer(everything(),names_to="type",values_to="logCPUE") |> 
+  mutate(cpue=10^logCPUE) |> 
+  ggplot(aes(cpue,fill=type))+geom_density(alpha=0.5)
+```
+
+### COG
+
+We can also use our model to estimate the center of gravity in each year, representing the centroid of fishing activity.
+
+```{r,message=F}
+predcog <- predict(mA1,newdata=grpred,return_tmb_object=T)
+mA1cog <- get_cog(predcog,format="wide")
+mA1cog2 <- get_cog(predcog)
+
+# in 1D
+mA1cog2 |> 
+  ggplot(aes(year,est,ymax=upr,ymin=lwr))+
+  geom_ribbon(fill="blue",alpha=0.5)+
+  geom_line()+
+  labs(title="COG over time")+
+  facet_wrap(~coord,scales='free',nrow=2)
+
+# in 2D
+mA1cog |> 
+  mutate(xend=lead(est_x),yend=lead(est_y)) |> 
+  ggplot(aes(est_x,est_y,xend=xend,yend=yend,color=year))+
+  geom_segment(linewidth=1,arrow=arrow(type = 'closed',length=unit(0.25,'cm')))+
+  geom_point()+
+  coord_fixed()+
+  scale_color_viridis()+
+  labs(title="COG over time",x="Xkm",y="Ykm")
+```
+
+It appears that the center of fishing activity has varied over time, shifting west from the beginning of the time series until the last couple of years in the data, when it shifts back to the east.
+
+### Index
+
+We can also build an index of CPUE.
+
+```{r}
+predind <- predict(mA1,nsim=200)
+mA1i <- get_index_sims(predind)
+                      # area_function=function(x,area)x*area,
+                      # agg_function=function(x,area)sum(x))
+mA1i |> 
+  ggplot(aes(year,est,ymin=lwr,ymax=upr))+
+  geom_ribbon(fill='blue',alpha=0.5)+geom_line()
+```
+
+## Cross-validation
+
+To do more formal model selection when examining different combinations of covariates, we want to set up a cross-validation procedure, instead of relying on something like AIC. Cross-validation will test out-of-sample prediction.
+
+We randomly place the data into 10 clusters. We will use these chunks of data to do 10-fold cross-validation, and can use the same folds across model configurations. This step is more computationally expensive, so we run it in parallel on multiple cores
+
+```{r}
+set.seed(130489)
+clust <- sample(seq_len(10), size = nrow(dat), replace = TRUE)
+# library(future)
+# plan("future::multisession",workers=4)
+```
+
+Run cross validation for the two model configurations.
+
+```{r}
+# for Model A1
+mA1_cv <- sdmTMB_cv(
+  mean_logCPUE ~ s(mean_suit,k=3),
+  data = datm,
+  mesh = bmesh,
+  spatial = "on",
+  spatiotemporal = "iid",
+  time="year",
+  fold_ids = clust)
+
+# for Model B1
+mB1_cv <- sdmTMB_cv(
+  mean_logCPUE ~ s(mean_suit,k=3),
+  data = datm,
+  mesh = bmesh,
+  spatial = "off",
+  spatiotemporal = "iid",
+  spatial_varying = ~ 0+seasonfct,
+  time="year",
+  fold_ids = clust)
+
+# for Model C1
+mC1_cv <- sdmTMB_cv(
+  mean_logCPUE ~ s(scaled_year)+seasonfct,
+  data = datm,
+  mesh = bmesh,
+  spatial = "off",
+  spatiotemporal = "off",
+  spatial_varying = ~ 0+mean_suit,
+  fold_ids=clust
+)
+```
+
+We can compare the summed negative log likelihood across folded models as a metric.
+```{r}
+mA1_cv$sum_loglik
+mB1_cv$sum_loglik
+mC1_cv$sum_loglik
+```
+
+Or with RMSE on held-out quantities
+
+```{r}
+A1_rmse <- sqrt(mean((mA1_cv$data$mean_logCPUE - mA1_cv$data$cv_predicted)^2))
+B1_rmse <- sqrt(mean((mB1_cv$data$mean_logCPUE - mB1_cv$data$cv_predicted)^2))
+C1_rmse <- sqrt(mean((mC1_cv$data$mean_logCPUE - mC1_cv$data$cv_predicted)^2))
+A1_rmse;B1_rmse;C1_rmse
+```
+
+Both of these metrics suggest that this Group B model has better predictive accuracy than the Group A or Group C model configuration.
+
+## Model Selection
+
+Now that we have a structure in place to fit models and compare them, we can test versions with all feasible combinations of environmental covariates, and select the model with the best predictive performance.
+
+First, we write a function that takes an vector with an arbitrary number of covariates, performs 10-fold cross-validation, and return the predictive log-likelihood and RMSE.
+
+```{r}
+# Arguments:
+# group: Group A B, or C models, effects how formulas are structured
+# covs: character vector of covariate names
+# kval: K value for GAM splines
+# folds: the vector of cluster assignments for cross validation
+test_model <- function(group="A",covs,kval=3,folds=clust){
+  
+  # make a formula with the chosen covariates and a designated spline K (default:3)
+  # doesn't matter for Group C models
+  spline_terms <- paste0("s(", covs, ",k=", kval, ")")
+  formstr <- paste("mean_logCPUE ~",paste(spline_terms, collapse = "+"))
+  form <- as.formula(formstr)
+  
+  if(!group%in%c("A","B","C")) stop("Group must be one of c(A,B,C)")
+  
+  # fit model using 10-fold CV
+  if(group=="A"){
+    fit <- sdmTMB(
+      formula=form,
+      data = datm,
+      mesh = bmesh,
+      spatial = "on",
+      spatiotemporal = "iid",
+      time="year")
+    # if the full model passes sanity checks, run CV, otherwise break
+    if(sanity(fit)$all_ok){
+      fit_cv <- sdmTMB_cv(
+        formula=form,
+        data = datm,
+        mesh = bmesh,
+        spatial = "on",
+        spatiotemporal = "iid",
+        time="year",
+        fold_ids = folds) 
+    } else return("sanity fail")
+  }
+  if(group=="B"){
+    fit <- sdmTMB(
+      formula=form,
+      data = datm,
+      mesh = bmesh,
+      spatial = "off",
+      spatiotemporal = "iid",
+      spatial_varying = ~ 0+seasonfct,
+      time="year")
+    if(sanity(fit)$all_ok){
+      fit_cv <- sdmTMB_cv(
+        formula=form,
+        data = datm,
+        mesh = bmesh,
+        spatial = "off",
+        spatiotemporal = "iid",
+        spatial_varying = ~ 0+seasonfct,
+        time="year",
+        fold_ids = folds) 
+    } else return("sanity fail")
+  }
+  # fit model using 10-fold CV
+  if(group=="C"){
+    form=as.formula(paste0("~ 0+",paste(covs,collapse="+")))
+    fit <- sdmTMB(
+      formula= mean_logCPUE~s(scaled_year)+seasonfct,
+      data = datm,
+      mesh = bmesh,
+      spatial = "off",
+      spatiotemporal = "off",
+      spatial_varying=form)
+    # if the full model passes sanity checks, run CV, otherwise break
+    if(sanity(fit)$all_ok){
+      fit_cv <- sdmTMB_cv(
+        formula=mean_logCPUE ~ s(scaled_year)+seasonfct,
+        data = datm,
+        mesh = bmesh,
+        spatial = "off",
+        spatiotemporal = "off",
+        spatial_varying = form,
+        fold_ids=clust)
+    } else return("sanity fail")
+  }
+  sum_nll <- fit_cv$sum_loglik
+  rmse <- sqrt(mean((fit_cv$data$mean_logCPUE - fit_cv$data$cv_predicted)^2))
+  list(group=group,covs=covs,sum_nll=sum_nll,rmse=rmse)
+}
+# soft landing for models that throw errors
+test_model_safe <- possibly(test_model,otherwise="Error")
+```
+
+```{r,message=F,warning=F}
+x <- test_model_safe(group="C",covs=c("scaled_sst","scaled_depth"))
+```
+
+All possible combinations of the covariates. Because they're all highly correlated, we only retain one of the suitability covariates at a time (`mean_suit`, `max_suit`, or `int_suit`).
+
+```{r}
+candidate_covs <- c("mean_suit","max_suit","int_suit","scaled_depth","scaled_sst")
+var_combs <- unlist(
+  lapply(seq_along(candidate_covs), function(k) combn(candidate_covs, k, simplify = FALSE)),
+  recursive = FALSE
+)
+# count the number of "_suit" variables
+nsuitv <- map_dbl(var_combs,\(x) sum(x%in%c("mean_suit","int_suit","max_suit")))
+# cut the combos with >1 "_suit" variable
+cuts <- which(test>1)
+var_combs <- var_combs[-cuts]
+```
+
+There are 15 combinations to test for each of the three model groups, making 45 configurations total. Now we can run the testing function for each of these options. This step will likely take time (lots of models to fit).
+
+```{r,message=F,warning=F}
+A_cv <- map(var_combs,\(x) test_model_safe(group="A",kval=3,folds=clust,covs = x))
+B_cv <- map(var_combs,\(x) test_model_safe(group="B",kval=3,folds=clust,covs = x))
+C_cv <- map(var_combs,\(x) test_model_safe(group="C",kval=3,folds=clust,covs = x))
+cvm <- c(A_cv,B_cv,C_cv)
+```
+
+```{r}
+cv_which <- which(!(cvm%in%c("Error","sanity fail")))
+cv_complete <- cvm[cv_which]
+
+nll <- map_dbl(cv_complete,\(x)x$sum_nll)
+rmse <- map_dbl(cv_complete,\(x)x$rmse)
+
+#
+model_tbl <- tibble(covars=rep(var_combs,3)) |> 
+  mutate(nll=NA,rmse=NA,id=row_number()) |> 
+  mutate(group=rep(c("A","B","C"),each=length(var_combs)))
+model_tbl$nll[cv_which] <- nll
+model_tbl$rmse[cv_which] <- rmse
+
+# knitr::kable(model_tbl)
+```
+
+```{r}
+model_tbl |>
+  slice_max(nll,na_rm=T,n=1)
+model_tbl |>
+  slice_min(rmse,na_rm=T,n=1)
+```
+
+The best performing model was model 20, a Group B model with `scaled_sst`. The best performing model containing a suitability metric was model 18, a Group B model with `int_suit` as a covariate. The best performing Group C model (i.e., the best model without using spatiotemporal fields) was model 44, with `max_suit`, `scaled_sst`, and `scaled_depth` as covariates.
+
+## Fit Selected Model
+
+Fit the full version of the selected model.
+
+```{r}
+# m <-sdmTMB(
+#       formula= mean_logCPUE~s(scaled_year)+seasonfct,
+#       data = datm,
+#       mesh = bmesh,
+#       spatial = "off",
+#       spatiotemporal = "off",
+#       spatial_varying= ~0+ max_suit+scaled_depth+scaled_sst)
+m <-sdmTMB(
+      mean_logCPUE~s(int_suit,k=3),
+      data = datm,
+      mesh = bmesh,
+      spatial = "off",
+      spatiotemporal = "iid",
+      spatial_varying = ~ 0+seasonfct,
+      time="year")
+```
+
+```{r}
+write_rds(m,here('output','alb_selected_model.rds'))
+```
+
+
+```{r}
+preds <- predict(m,newdata=grpred)
+```
+
+```{r}
+# quickmap(preds,zeta_s_max_suit)+labs(title="Effect of Max Suitability")
+# quickmap(preds,zeta_s_scaled_sst)+labs(title="Effect of SST")
+# quickmap(preds,zeta_s_scaled_depth)+labs(title="Effect of Max Suitable Depth")
+quickmap(preds,zeta_s_seasonfctJJ)+labs(title="Effect of Jun/Jul")
+quickmap(preds,zeta_s_seasonfctAS)+labs(title="Effect of Aug/Sep")
+quickmap(preds,zeta_s_seasonfctON)+labs(title="Effect of Oct/Nov")
+```
+
+```{r}
+p <- preds |>
+  quickmap(epsilon_st)+
+  facet_wrap(~year)+
+  scale_fill_viridis(option="A")+
+  labs(title= "Spatiotemporal Fields")
+p
+```
+
+Suitability effect spline
+
+```{r}
+dc <- data.frame(
+  int_suit = seq(min(datm$int_suit),
+    max(datm$int_suit),
+    length.out = 100
+  ),
+  scaled_depth = 0, # an arbitrary year
+  seasonfct="AS",
+  # max_suit=mean(datm$int_suit),
+  scaled_depth=0,
+  scaled_sst=0,
+  year=2007
+)
+pc <- predict(m, newdata = dc, se_fit = TRUE, re_form = NA)
+ggplot(pc, aes(int_suit, est,
+  ymin = est - 1.96 * est_se,
+  ymax = est + 1.96 * est_se)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.4) +
+  # scale_x_continuous(labels = function(x) round(x*10+mean(datm$year))) +
+  coord_cartesian(expand = F) +
+  labs(x = "Integrated Suitability", y = "Conditional Effect")
+```
+
+Year effect spline
+
+```{r}
+# dc <- data.frame(
+#   scaled_year = seq(min(datm$scaled_year),
+#     max(datm$scaled_year),
+#     length.out = 100
+#   ),
+#   scaled_depth = 0, # an arbitrary year
+#   seasonfct="AS",
+#   max_suit=mean(datm$max_suit),
+#   # scaled_depth=0,
+#   scaled_sst=0
+# )
+# pc <- predict(m, newdata = dc, se_fit = TRUE, re_form = NA)
+# ggplot(pc, aes(scaled_year, est,
+#   ymin = est - 1.96 * est_se,
+#   ymax = est + 1.96 * est_se)) +
+#   geom_line() +
+#   geom_ribbon(alpha = 0.4) +
+#   scale_x_continuous(labels = function(x) round(x*10+mean(datm$year))) +
+#   coord_cartesian(expand = F) +
+#   labs(x = "Year", y = "Conditional Effect")
+```
+
+Season effects
+
+```{r}
+# coefs <- tidy(m, conf.int = TRUE)
+# pcoefs <- coefs |> 
+#   mutate(term=c("Jun-Jul","Aug-Sep","Oct-Nov","yr")) |>
+#   mutate(term=factor(term,levels=c("Jun-Jul","Aug-Sep","Oct-Nov"))) |> 
+#   filter(!term=="yr") |> 
+#   ggplot(aes(term,estimate,ymin=conf.low,ymax=conf.high))+
+#   geom_col()+geom_pointrange()+
+#   geom_hline(yintercept=0,linetype=2)
+# pcoefs
+```
+
+Predictions
+
+```{r,fig.height=8,fig.width=8}
+p <- preds |>
+  quickmap(est)+
+  facet_grid(year~monthfct)+
+  scale_fill_viridis(option="A")+
+  labs(title= "Log CPUE")
+p
+```
+
+Predicted vs. observed
+
+```{r}
+predobs <- predict(m)
+
+# calculate SE
+psim <- predict(m,nsim=200)
+predobs$se_est <- apply(psim,1,sd)
+
+predobs |> 
+  ggplot(aes(mean_logCPUE,est,ymax=est+se_est,ymin=est-se_est))+
+  geom_pointrange(size=0.25,alpha=0.5)+
+  coord_equal()+
+  labs(x="Observed",y="Predicted",title="Predicted vs. Observed, log CPUE")+
+  geom_abline(slope=1,intercept=0,color="red",linetype=2)
+```
+
+Now make a QQ plot using the `DHARMA` package
+
+```{r}
+predobs$resids <- residuals(m)
+simresids <- simulate(m,nsim=200,type = 'mle-mvn')
+dharma_residuals(simresids,m)
+```
+
+We can look at how those residuals are distributed in space and time. Here, we would look for model misspecification if there are large, spatially biased areas with consistently positive or negative residuals, suggesting the model is not performing well in certain places.
+
+```{r}
+# spatial residuals
+predobs |> 
+  ggplot(aes(Xkm,Ykm,color=resids))+
+  geom_jitter(size=1,width = 100)+
+  coord_fixed()+
+  scale_color_gradient2()
+```
+
+```{r}
+# temporal residuals
+predobs |> 
+  ggplot(aes(year,resids))+
+  geom_point()+
+  geom_smooth(se=F)
+```
+
+These are smoothed histograms of the distribution of CPUE in the data ("observed") vs. the fitted model ("estimated"). We can see that the model is still a little bit "mean-centered" (i.e., the estimated values have a smaller variance), with not as many extreme values on the high or low end.
+
+```{r}
+predobs |> 
+  dplyr::select(observed=mean_logCPUE,estimated=est) |> 
+  pivot_longer(everything(),names_to="type",values_to="logCPUE") |> 
+  ggplot(aes(logCPUE,fill=type))+geom_density(alpha=0.5)
+predobs |> 
+  dplyr::select(observed=mean_logCPUE,estimated=est) |>
+  pivot_longer(everything(),names_to="type",values_to="logCPUE") |> 
+  mutate(cpue=10^logCPUE) |> 
+  ggplot(aes(cpue,fill=type))+geom_density(alpha=0.5)
+```
+
+## Testing
+
+```{r}
+m3 <- sdmTMB(
+  mean_logCPUE ~ scaled_year+s(mean_suit,k=3)+s(scaled_sst,k=3),
+  data = datm,
+  mesh = bmesh,
+  spatial = "on",
+  spatial_varying = ~ 0 + scaled_year,
+  time="year"
+)
+```
+
+As with the first model above, we can perform a series of initial checks on model performance.
+
+```{r}
+# did it run ok?
+sanity(m3)
+# quick summary
+summary(m3)
+# main fixed effects
+tidy(m3,"fixed")
+# random effect paramters
+tidy(m3,"ran_pars")
+```
+
+predict
+```{r}
+pred3 <- predict(m3,newdata=grpred)
+```
+map
+```{r}
+quickmap(pred3,zeta_s_seasonfctON)+
+  labs(title="Spatial Field")
+```
+
+```{r,warning=F}
+quickmap(pred3,zeta_s_mean_suit)+
+  labs(title="")
+quickmap(pred3,zeta_s_wdepth)+
+  labs(title="")
+quickmap(pred3,zeta_s_sst)+
+  scale_fill_viridis(option="B")+
+  labs(title="")
+```
+
+```{r,warning=F,fig.width=8,fig.height=8}
+quickmap(pred3,est_non_rf)+
+  labs(title="Fixed Effects Only")+
+  facet_grid(year~monthfct)
+```
+
+And the spatiotemporal fields
+
+```{r}
+quickmap(pred3,epsilon_st)+
+  facet_wrap(~year) +
+  labs(title="Annual Spatiotemporal Fields")
+```
+
+All random spatial fields together, by month across years.
+
+```{r,warning=F,fig.width=7.5}
+pred3 |>
+  group_by(Xkm,Ykm,seasonfct) |> 
+  summarise(est_rf=mean(est_rf),.groups='drop') |> 
+  quickmap(est_rf)+
+  labs(title="All Spatial Fields")+facet_wrap(~seasonfct)
+```
+
+```{r}
+dc <- data.frame(
+  scaled_year = seq(min(datm$scaled_year),
+    max(datm$scaled_year),
+    length.out = 100
+  ),
+  mean_suit=mean(datm$mean_suit),
+  wdepth=mean(datm$wdepth),
+  sst=mean(datm$sst),
+  year = 2007, # a chosen year
+  seasonfct="JJ"
+)
+pc <- predict(m3, newdata = dc, se_fit = TRUE, re_form = NA)
+ggplot(pc, aes(scaled_year, est,
+  ymin = est - 1.96 * est_se,
+  ymax = est + 1.96 * est_se)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.4) +
+  scale_x_continuous() +
+  coord_cartesian(expand = F) +
+  labs(x = "Year", y = "Conditional Effect")
+```
+

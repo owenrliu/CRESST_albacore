@@ -1,0 +1,38 @@
+---
+title: "OIF Model Projections"
+format: html
+toc: true
+toc_float: true
+toc-title: "Navigation"
+embed-resources: true
+editor: source
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r,warning=F,message=F,include=F}
+library(tidyverse)
+library(terra)
+library(sf)
+library(sdmTMB)
+library(viridis)
+library(here)
+library(rnaturalearth)
+library(sdmTMBextra)
+
+tm <- theme_minimal()+theme(panel.border = element_rect(fill=NA,color='black'))
+theme_set(tm)
+```
+
+## Purpose
+
+Explore changes in projected albacore fishery CPUE as a result of ocean iron fertilizatino (OIF). Based on fishery logbook and albacore species distribution model data, we designed and built a model to predict logbook CPUE in `fdms w cov.qmd`. Now, we take the selected model and project it under simulated, alternative albacore suitability scenarios resulting from OIF in the North Pacific.
+
+## Load Data
+
+The OIF scenarios come in a very large file
+
+
+
