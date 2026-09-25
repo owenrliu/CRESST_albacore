@@ -32,7 +32,196 @@ Explore changes in projected albacore fishery CPUE as a result of ocean iron fer
 
 ## Load Data
 
-The OIF scenarios come in a very large file
+The OIF scenarios have been processed into a list of prediction grids, one for each scenario. See `make_cov_proj_grid.R`
 
+```{r}
+pgl <- read_rds(here('data','predgrid_all_OIF_scenarios.rds'))
+```
+
+Here's our fitted and selected `sdmTMB` model.
+
+```{r}
+m <- read_rds(here('output','alb_selected_model.rds'))
+```
+
+## Make projections
+
+```{r}
+projs <- imap(pgl,\(x,y) predict(m,newdata=x) |> mutate(scenario=y))
+projdf <- bind_rows(projs)
+```
+
+## Mean CPUE Differences
+
+What sort of comparisons do we want to make between the various iron fertilization scenarios and the baseline (historical) scenario? We could start by differencing them:
+
+```{r}
+# the baseline estimates are from scenario 1
+# est is the model prediction (i.e., predicted log CPUE)
+base_ests <- projs[[1]] |> select(est:est_rf) |> 
+  # exponentiate so the difference is made correctly?
+  mutate(across(everything(),exp))
+diffs <- imap(projs,\(x,y) {
+  scen_ests <- x |> 
+    select(est:est_rf) |> 
+    mutate(across(everything(),exp))
+  # subtract baseline estimates
+  out <- scen_ests-base_ests
+  out |> 
+    rename_with(~paste0("d_",.x),everything()) |> 
+    mutate(scenario=y)
+})
+diffdf <- bind_rows(diffs)
+
+# projections with scenario diffs
+scens_df <- projdf |> 
+  select(-scenario) |> 
+  bind_cols(diffdf) |> 
+  mutate(scenario=as.factor(scenario))
+```
+
+How big of potential differences are we talking here.
+
+```{r}
+# this is across all predicted grid cells and time steps
+diffsumm <- scens_df |> 
+  mutate(expest=exp(est)) |> 
+  mutate(propdiff=d_est/expest) |> 
+  group_by(scenario) |> 
+  summarise(meandiff=mean(d_est),
+            q05=as.numeric(quantile(d_est,0.05)),
+            q95=as.numeric(quantile(d_est,0.90)),
+            meanprop=mean(propdiff),.groups='drop',
+            q05prop=as.numeric(quantile(propdiff,0.05)),
+            q95prop=as.numeric(quantile(propdiff,0.90)))
+knitr::kable(diffsumm,digits = 4)
+```
+
+In general, it seems like the projected CPUE changes are within approximately -20% to 6%, across all time steps and grid cells. Here we can see that in smoothed histograms of the differences. 
+
+```{r}
+p_props <- scens_df |> 
+  filter(scenario!="1") |> 
+  mutate(expest=exp(est)) |> 
+  mutate(propdiff=d_est/expest) |> 
+  ggplot(aes(propdiff,fill=scenario))+
+  geom_density(alpha=0.5)+
+  scale_fill_manual(values=viridis_pal()(7))+
+  labs(x="Proportional Difference")
+p_props
+```
+
+
+
+```{r}
+p_diffs <- scens_df |> 
+  filter(scenario!="1") |> 
+  ggplot(aes(d_est,fill=scenario))+
+  geom_density(alpha=0.5)+
+  geom_vline(xintercept=0,linetype=2)+
+  scale_fill_manual(values=viridis_pal()(7))+
+  labs(x="Difference in Predicted CPUE")
+p_diffs
+
+ggsave(here('plots','OIF scenarios CPUE diffs density.png'),p_diffs)
+```
+
+```{r}
+p_diffs2 <- scens_df |>  
+  filter(scenario!=1) |> 
+  ggplot(aes(exp(est),d_est,color=scenario))+
+  geom_point(size=0.5)+
+  facet_wrap(~scenario)+
+  scale_color_manual(values=viridis_pal()(7))+
+  geom_hline(yintercept=0,linetype=2)+
+  labs(x="Base Predicted CPUE",y="Difference")
+p_diffs2
+
+ggsave(here('plots','OIF scenarios base vs diff.png'),p_diffs2,w=10)
+```
+
+```{r}
+pdiffs3 <- scens_df |> 
+  filter(scenario!="1") |> 
+  ggplot(aes(monthfct,d_est,fill=scenario))+
+  geom_boxplot(outliers=F)+
+  geom_hline(yintercept=0,linetype=2)+
+  facet_wrap(~scenario)+
+  scale_fill_manual(values=viridis_pal()(7))+
+  labs(x="Month",y="CPUE Difference")
+pdiffs3
+
+ggsave(here('plots','CPUE diff month OIF scenarios.png'),pdiffs3,w=10)
+```
+It sort of seems like across many OIF scenarios, predicted CPUE is lower in June/July and a bit higher in August/September, compared to the baseline scenario.
+
+## Spatial Changes
+
+How did spatial patterns of CPUE change in these different scenarios?
+
+```{r}
+quickmap <- function(dat, column = est) {
+  ggplot()+
+    geom_raster(data=dat, aes(Xkm, Ykm, fill = {{ column }})) +
+    coord_fixed() +
+    scale_fill_gradient2()+
+    theme(panel.background=element_rect(fill='gray80'),
+          panel.grid = element_blank())
+}
+```
+
+Example of differences, for scenario 2 relative to baseline
+
+```{r}
+p_s2 <- scens_df |> 
+  filter(scenario=="2",monthfct!="November") |> 
+  quickmap(d_est)+facet_grid(seasonfct~year)+
+  labs(fill=expression(Delta ~ "CPUE"))+
+  theme(axis.text=element_blank())
+p_s2
+ggsave(here('plots','OIF scenario 2.png'),p_s2,w=10)
+```
+
+What if we looked at the mean difference and the variance among all scenarios.
+
+```{r}
+# calculate mean difference in each location
+meandiff_df <- scens_df |> 
+  group_by(Xkm,Ykm,year,month,season,seasonfct,monthfct) |> 
+  # remove the null scenario
+  filter(scenario!="1") |> 
+  mutate(expest=exp(est)) |> 
+  summarise(meandiff=mean(d_est),
+            # relative to predicted CPUE
+            propdiff=mean(d_est/expest),
+            rangediff = max(d_est)-min(d_est),.groups='drop')
+```
+
+```{r}
+p_meandiff <- meandiff_df |> 
+  quickmap(meandiff)+
+  facet_grid(seasonfct~year)+
+  theme(axis.text=element_blank())+
+  labs(fill=expression(Delta ~ "CPUE"),title="Average difference between OIF scenarios and baseline")
+p_rangediff <-meandiff_df |> 
+  quickmap(rangediff)+
+  scale_fill_viridis(option="C")+
+  facet_grid(seasonfct~year)+
+  theme(axis.text=element_blank())+
+  labs(fill=expression(Delta ~ "CPUE"),title="Range of outcomes across OIF scenarios")
+
+p_propdiff <-meandiff_df |> 
+  quickmap(propdiff)+
+  facet_grid(seasonfct~year)+
+  theme(axis.text=element_blank())+
+  labs(fill=expression(Delta ~ "CPUE"),title="Mean proportional change across OIF scenarios")
+p_meandiff
+p_rangediff
+p_propdiff
+
+ggsave(here('plots','OIF scenarios mean.png'),p_meandiff,w=10)
+ggsave(here('plots','OIF scenarios range.png'),p_rangediff,w=10)
+ggsave(here('plots','OIF scenarios proportions.png'),p_propdiff,w=10)
+```
 
 

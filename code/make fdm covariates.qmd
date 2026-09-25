@@ -58,7 +58,6 @@ scen_vars <- tibble(v = names(asdm)[grepl("y_pred",names(asdm))]) |>
 names(asdm)[grepl("y_pred",names(asdm))] <- scen_vars$scenario
 ```
 
-
 Because the data are 3-D (time by space by depth layer), and we need 2D covariates (time by space), we need to make decisions about how to "flatten" the data at each time point. Sea surface temperature should already be the same across depth. Let's make sure.
 
 ```{r}
